@@ -38,20 +38,27 @@ class YearEndRewindCalculator {
 
   // Calculate peak rank
   getPeakRank(leagueEntries) {
+    if (!Array.isArray(leagueEntries) || leagueEntries.length === 0) {
+      return { tier: 'UNRANKED', division: '', lp: 0 };
+    }
+    
     let peakTier = 'UNRANKED';
     let peakDivision = '';
     let peakLP = 0;
     
     leagueEntries.forEach(entry => {
+      if (!entry || typeof entry !== 'object') return;
+      
       const tierValue = this.getTierValue(entry.tier);
       const divisionValue = this.getDivisionValue(entry.division);
+      const leaguePoints = parseInt(entry.leaguePoints, 10) || 0;
       
       if (tierValue > this.getTierValue(peakTier) || 
          (tierValue === this.getTierValue(peakTier) && divisionValue > this.getDivisionValue(peakDivision)) ||
-         (tierValue === this.getTierValue(peakTier) && divisionValue === this.getDivisionValue(peakDivision) && entry.leaguePoints > peakLP)) {
-        peakTier = entry.tier;
-        peakDivision = entry.division;
-        peakLP = entry.leaguePoints;
+         (tierValue === this.getTierValue(peakTier) && divisionValue === this.getDivisionValue(peakDivision) && leaguePoints > peakLP)) {
+        peakTier = entry.tier || 'UNRANKED';
+        peakDivision = entry.division || '';
+        peakLP = leaguePoints;
       }
     });
     
@@ -60,6 +67,8 @@ class YearEndRewindCalculator {
 
   // Helper function to get tier numerical value
   getTierValue(tier) {
+    if (!tier || typeof tier !== 'string') return 0;
+    
     const tiers = {
       'IRON': 1, 'BRONZE': 2, 'SILVER': 3, 'GOLD': 4,
       'PLATINUM': 5, 'EMERALD': 6, 'DIAMOND': 7,
@@ -71,6 +80,8 @@ class YearEndRewindCalculator {
 
   // Helper function to get division numerical value
   getDivisionValue(division) {
+    if (!division || typeof division !== 'string') return 0;
+    
     const divisions = {
       'IV': 1, 'III': 2, 'II': 3, 'I': 4
     };

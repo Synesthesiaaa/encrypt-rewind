@@ -1,12 +1,25 @@
 // deploy-commands.js
 // Quick guild-only command deployer for testing
+require('dotenv').config();
 const { REST, Routes } = require('discord.js');
 const fs = require('fs');
 const path = require('path');
 
-const TOKEN = 'ODg3NTY2OTQ2NjQyNTc5NDk4.G8QRox.KobUl6k874Bk89pcOuaYLW5CvnMGAAgMSkrehs';          // ← paste your bot token here
-const CLIENT_ID = '887566946642579498';  // ← your Client ID
-const GUILD_ID = '914905357879504896';   // ← your Zzz server ID
+const TOKEN = process.env.DISCORD_TOKEN;
+const CLIENT_ID = process.env.DISCORD_CLIENT_ID || '887566946642579498';
+const GUILD_ID = process.env.DISCORD_GUILD_ID;
+
+if (!TOKEN) {
+  console.error('❌ DISCORD_TOKEN is not set in environment variables!');
+  console.error('   Please create a .env file with: DISCORD_TOKEN=your_bot_token_here');
+  process.exit(1);
+}
+
+if (!GUILD_ID) {
+  console.error('❌ DISCORD_GUILD_ID is not set in environment variables!');
+  console.error('   Please create a .env file with: DISCORD_GUILD_ID=your_guild_id_here');
+  process.exit(1);
+}
 
 const commands = [];
 const commandsPath = path.join(__dirname, 'src', 'commands');

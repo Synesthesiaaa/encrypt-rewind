@@ -12,7 +12,7 @@ https://github.com/user-attachments/assets/a5817158-42a5-4788-92e1-3ca940f65d98
 ## 🌟 Features
 
 - `/ping` — Check bot status
-- `/lolstats <summoner_name>` — Get your **2024 Year-End Rewind**:
+- `/lolstats <riot_id>` — Get your **2024 Year-End Rewind** (format: `GameName#TagLine`):
   - 📊 Total games, win rate, KDA
   - 👑 Top 3 champions & roles
   - 🔥 Memorable streaks & milestones
@@ -24,18 +24,56 @@ https://github.com/user-attachments/assets/a5817158-42a5-4788-92e1-3ca940f65d98
 
 1. Invite the bot to your Discord server:  
    [`[Invite Link]`](https://discord.com/api/oauth2/authorize?client_id=887566946642579498&permissions=0&scope=bot+applications.commands)
-2. Type `/lolstats YourSummoner#Tag` in any channel
+2. Type `/lolstats YourGameName#TagLine` in any channel (e.g., `SummonerName#TAG1`)
 3. Watch your epic rewind unfold! ✨
 
 > 💡 *Replace with your real invite link once deployed.*
 
 ## 🛠️ Self-Hosting
 
+### Prerequisites
+- Node.js 18.17+ installed
+- A Discord Bot Token ([Discord Developer Portal](https://discord.com/developers/applications))
+- A Riot Games API Key ([See Setup Guide](./RIOT_API_SETUP.md))
+
 ### Setup
 ```bash
 git clone https://github.com/synesthesiaaa/lol-rewind.git
 cd lol-rewind
 npm install
+```
+
+### Configuration
+
+1. **Set up Riot Games API Key**:
+   - Follow the detailed guide: [RIOT_API_SETUP.md](./RIOT_API_SETUP.md)
+   - This includes creating a developer account, registering your product, and generating an API key
+
+2. **Create `.env` file**:
+   ```env
+   RIOT_API_KEY=your_riot_api_key_here
+   RIOT_API_REGION=sg2
+   DISCORD_TOKEN=your_discord_bot_token_here
+   DISCORD_CLIENT_ID=your_client_id_here
+   DISCORD_GUILD_ID=your_guild_id_here
+   ```
+   
+   **Note**: `RIOT_API_REGION` must be a **platform** routing value (e.g., `na1`, `euw1`, `sg2`, `oc1`), not a regional routing value (e.g., `americas`, `europe`, `sea`). See [RIOT_API_SETUP.md](./RIOT_API_SETUP.md) for the complete list.
+
+3. **Test your API key**:
+   ```bash
+   npm run check-api
+   ```
+
+4. **Deploy commands**:
+   ```bash
+   npm run deploy
+   ```
+
+5. **Start the bot**:
+   ```bash
+   npm start
+   ```
 
 📦 Project Structure
 src/
