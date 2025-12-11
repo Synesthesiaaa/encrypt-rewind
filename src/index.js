@@ -106,6 +106,15 @@ if (!process.env.DISCORD_TOKEN) {
   process.exit(1);
 }
 
+// Validate Riot API key (import service to trigger validation)
+const RiotAPIService = require('./services/RiotAPIService');
+if (!RiotAPIService.apiKey || typeof RiotAPIService.apiKey !== 'string' || RiotAPIService.apiKey.trim().length === 0) {
+  console.error('❌ RIOT_API_KEY is not set or is empty in environment variables!');
+  console.error('   Please create/update your .env file with: RIOT_API_KEY=your_api_key_here');
+  console.error('   Get your API key from: https://developer.riotgames.com/');
+  process.exit(1);
+}
+
 // Login to Discord
 client.login(process.env.DISCORD_TOKEN)
   .then(() => console.log('🤖 Bot successfully logged in to Discord!'))

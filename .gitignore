@@ -32,3 +32,4 @@ Thumbs.db
 
 #register-commands
 .register-commands.ps1
+.env

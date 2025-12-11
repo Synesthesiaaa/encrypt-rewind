@@ -11,10 +11,31 @@ module.exports = {
     .addStringOption(option => 
       option.setName('riot_id')
         .setDescription('Your Riot ID (format: GameName#TagLine, e.g., "SummonerName#TAG1")')
-        .setRequired(true)),
+        .setRequired(true))
+    .addStringOption(option =>
+      option.setName('region')
+        .setDescription('Your account region (optional - helps find your account faster)')
+        .setRequired(false)
+        .addChoices(
+          { name: '🇺🇸 Americas (NA, BR, LAN, LAS)', value: 'americas' },
+          { name: '🇪🇺 Europe (EUW, EUNE, TR, RU)', value: 'europe' },
+          { name: '🇰🇷 Asia (KR, JP)', value: 'asia' },
+          { name: '🌏 SEA (OCE, SG, TW, VN, PH)', value: 'sea' },
+          { name: '🇺🇸 North America (NA1)', value: 'na1' },
+          { name: '🇧🇷 Brazil (BR1)', value: 'br1' },
+          { name: '🇪🇺 Europe West (EUW1)', value: 'euw1' },
+          { name: '🇪🇺 Europe Nordic & East (EUN1)', value: 'eun1' },
+          { name: '🇰🇷 Korea (KR)', value: 'kr' },
+          { name: '🇯🇵 Japan (JP1)', value: 'jp1' },
+          { name: '🇦🇺 Oceania (OC1)', value: 'oc1' },
+          { name: '🇸🇬 Singapore (SG2)', value: 'sg2' }
+        )),
   
   async execute(interaction) {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    
+    // Get user-provided region (optional)
+    const userRegion = interaction.options.getString('region');
     
     // Try to get riot_id, fallback to summoner_name for backward compatibility
     let riotId = interaction.options.getString('riot_id');
@@ -84,7 +105,7 @@ module.exports = {
       // Get summoner data using Riot ID (new recommended method)
       let summoner;
       try {
-        summoner = await RiotAPIService.getSummonerByRiotId(trimmedRiotId);
+        summoner = await RiotAPIService.getSummonerByRiotId(trimmedRiotId, userRegion);
       } catch (apiError) {
         // Handle validation errors from the service
         if (apiError.message && apiError.message.includes('Invalid Riot ID format')) {
@@ -97,16 +118,27 @@ module.exports = {
         
         // Handle API errors specifically
         if (apiError.response?.status === 404 || apiError.status === 404) {
+          const regionInfo = userRegion ? ` in region **${userRegion}**` : '';
+          const regionHint = userRegion ? '' : '\n💡 **Tip:** Try specifying your region using the `/lolstats` command\'s `region` option!';
           await interaction.editReply({
-            content: `❌ Riot ID **${trimmedRiotId}** not found.\n\nPlease check:\n• The Riot ID is spelled correctly (format: GameName#TagLine)\n• The tag line is correct (case-sensitive)\n• The account exists in the selected region (${process.env.RIOT_API_REGION || 'sg2'})\n• You're using the correct server/region`,
+            content: `❌ Riot ID **${trimmedRiotId}** not found${regionInfo}.\n\nPlease check:\n• The Riot ID is spelled correctly (format: GameName#TagLine)\n• The tag line is correct (case-sensitive)\n• The account exists in the specified region${regionHint}\n• Try a different region if your account is in a different server`,
             flags: MessageFlags.Ephemeral
           });
           return;
         }
         
         if (apiError.response?.status === 403 || apiError.status === 403) {
+          const errorUrl = apiError.url || apiError.config?.url || 'Unknown URL';
+          const errorDetails = apiError.response?.data ? JSON.stringify(apiError.response.data, null, 2) : 'No additional details';
+          console.error('🔑 403 Authentication Error Details:', {
+            url: errorUrl,
+            responseData: apiError.response?.data,
+            riotId: trimmedRiotId,
+            apiKeyPreview: process.env.RIOT_API_KEY ? `${process.env.RIOT_API_KEY.substring(0, 8)}...${process.env.RIOT_API_KEY.substring(process.env.RIOT_API_KEY.length - 4)}` : 'MISSING'
+          });
+          
           await interaction.editReply({
-            content: '❌ **API Authentication Failed**\n\nThe Riot API key is invalid, expired, or missing permissions.\n\nPlease contact the bot administrator to update the API key.',
+            content: '❌ **API Authentication Failed (403 Forbidden)**\n\nThe Riot API key is invalid, expired, or missing permissions.\n\n**⚠️ Most Common Cause:**\n• **API key expired** - Riot Personal API Keys expire after **24 hours**\n\n**Other possible causes:**\n• API key missing Account API v1 permissions\n• Wrong API key type (needs Personal API Key, not Production)\n• Region mismatch\n• API key format issue\n\n**To fix:**\n1. Go to https://developer.riotgames.com/\n2. Log in and check your API keys\n3. **Generate a NEW Personal API Key** (old ones expire!)\n4. Ensure it has Account API v1 access\n5. Copy the key EXACTLY (no spaces/quotes)\n6. Update the bot\'s `.env` file: `RIOT_API_KEY=your_new_key_here`\n7. Restart the bot\n\nPlease contact the bot administrator to update the API key.',
             flags: MessageFlags.Ephemeral
           });
           return;
@@ -151,7 +183,7 @@ module.exports = {
       console.log(`✅ Found summoner: ${displayName} (PUUID: ${summoner.puuid.substring(0, 8)}...)`);
       
       // Get match history (last 50 ranked games of the year)
-      const matchIds = await RiotAPIService.getMatchHistory(summoner.puuid, 0, 50);
+      const matchIds = await RiotAPIService.getMatchHistory(summoner.puuid, 0, 50, userRegion);
       
       if (!matchIds || matchIds.length === 0) {
         await interaction.editReply({
@@ -165,7 +197,7 @@ module.exports = {
       const matches = [];
       for (const matchId of matchIds) {
         try {
-          const matchDetails = await RiotAPIService.getMatchDetails(matchId);
+          const matchDetails = await RiotAPIService.getMatchDetails(matchId, userRegion);
           
           // Validate match details structure
           if (!matchDetails || !matchDetails.info || !Array.isArray(matchDetails.info.participants)) {
