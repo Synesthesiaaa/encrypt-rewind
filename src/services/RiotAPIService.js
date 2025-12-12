@@ -1,51 +1,39 @@
 // src/services/RiotAPIService.js
 const axios = require('axios');
 require('dotenv').config();
+const Logger = require('../utils/Logger');
+const CacheService = require('../utils/CacheService');
+const APIMonitor = require('../utils/APIMonitor');
+const APIKeyManager = require('../utils/APIKeyManager');
 
 class RiotAPIService {
   constructor() {
-    const rawApiKey = process.env.RIOT_API_KEY;
-    
-    if (!rawApiKey) {
-      console.error('❌ RIOT_API_KEY is not set in environment variables!');
-      console.error('   Please create a .env file with: RIOT_API_KEY=your_api_key_here');
-      console.error('   Get your API key from: https://developer.riotgames.com/');
+    // API keys are now managed by APIKeyManager
+    // Keep this.apiKey for backward compatibility (will use first available key)
+    try {
+      const firstKey = APIKeyManager.getNextAPIKey();
+      this.apiKey = firstKey ? firstKey.key : null;
+    } catch (error) {
       this.apiKey = null;
+    }
+    
+    if (!this.apiKey) {
+      Logger.error('No API keys available!');
+      Logger.error('Please set RIOT_API_KEY or RIOT_API_KEY_2, RIOT_API_KEY_3, etc. in your .env file');
+      Logger.error('Get your API key from: https://developer.riotgames.com/');
     } else {
-      // Trim whitespace from API key (common issue)
-      this.apiKey = rawApiKey.trim();
-      
-      // Remove any non-printable characters that might cause issues
-      this.apiKey = this.apiKey.replace(/[\x00-\x1F\x7F-\x9F]/g, '');
-      
-      if (this.apiKey.length === 0) {
-        console.error('❌ RIOT_API_KEY is set but empty after trimming!');
-        console.error('   Please check your .env file and ensure the API key is not empty.');
-        this.apiKey = null;
-      } else if (this.apiKey.length < 20) {
-        console.warn('⚠️  RIOT_API_KEY appears to be invalid (too short). Riot API keys are typically longer.');
-        console.warn('   Current length:', this.apiKey.length);
-        console.warn('   Preview:', this.apiKey.substring(0, 8) + '...' + this.apiKey.substring(this.apiKey.length - 4));
-      } else if (rawApiKey !== this.apiKey) {
-        console.warn('⚠️  RIOT_API_KEY had leading/trailing whitespace or special characters. It has been cleaned.');
-        console.warn('   Original length:', rawApiKey.length, '→ Cleaned length:', this.apiKey.length);
-      } else {
-        console.log('✅ RIOT_API_KEY loaded successfully (length:', this.apiKey.length, 'characters)');
-      }
-      
-      // Validate API key format (Riot API keys are typically alphanumeric with hyphens)
-      if (this.apiKey && !/^[A-Za-z0-9\-_]+$/.test(this.apiKey)) {
-        console.warn('⚠️  RIOT_API_KEY contains unusual characters. This might cause authentication issues.');
-        console.warn('   Riot API keys should only contain letters, numbers, hyphens, and underscores.');
-      }
+      Logger.success(`RiotAPIService initialized with ${APIKeyManager.apiKeys.length} API key(s)`);
     }
     
     // ============================================================================
     // ROUTING VALUES CONFIGURATION
     // ============================================================================
-    // Riot API uses TWO different types of routing values:
-    // 1. PLATFORM routing values (v4 APIs): na1, euw1, sg2, oc1, etc.
-    // 2. REGIONAL routing values (v5 APIs): americas, europe, asia, sea
+    // Riot API uses DIFFERENT routing values for different APIs:
+    // 1. Account API v1: REGIONAL routing (americas, asia, europe) - NO sea support!
+    //    - Can query accounts from any region using these three values
+    //    - SEA accounts must be queried using 'asia' regional value
+    // 2. Match API v5: REGIONAL routing (americas, asia, europe, sea) - includes sea
+    // 3. Summoner/League/Champion Mastery v4: PLATFORM routing (na1, euw1, sg2, oc1, etc.)
     // See: https://developer.riotgames.com/docs/lol#routing-values
     // ============================================================================
     
@@ -138,10 +126,25 @@ class RiotAPIService {
     this.isProcessing = false;
     this.rateLimitWindow = 1000; // 1 second
     this.maxRequestsPerWindow = 20;
+    
+    // Request throttling - track requests per time window
+    this.requestTimestamps = [];
+    this.lastRequestTime = 0;
+    this.minRequestInterval = 50; // Minimum 50ms between requests (20 req/sec max)
+    
+    // Cleanup old timestamps periodically
+    setInterval(() => {
+      const oneMinuteAgo = Date.now() - 60000;
+      this.requestTimestamps = this.requestTimestamps.filter(ts => ts > oneMinuteAgo);
+    }, 60000); // Clean every minute
   }
 
   // Helper method to resolve region and platform from user input
-  resolveRegionAndPlatform(userRegion) {
+  // IMPORTANT: Different APIs use different routing values:
+  // - Account API v1: uses americas, asia, europe (NO sea - maps SEA to asia)
+  // - Match API v5: uses americas, asia, europe, sea (includes sea)
+  // - Summoner/League/Champion Mastery v4: uses platform values (na1, euw1, sg2, etc.)
+  resolveRegionAndPlatform(userRegion, forAccountAPI = false, forMatchAPI = false) {
     const validPlatforms = ['br1', 'eun1', 'euw1', 'jp1', 'kr', 'la1', 'la2', 'na1', 'oc1', 'tr1', 'ru', 'sg2', 'tw2', 'vn2'];
     const validRegions = ['americas', 'europe', 'asia', 'sea'];
     
@@ -166,7 +169,7 @@ class RiotAPIService {
       // Asia region platforms → asia regional routing
       'kr': 'asia',
       'jp1': 'asia',
-      // SEA region platforms → sea regional routing
+      // SEA region platforms → sea regional routing (for Match API v5)
       // Note: ph2, th2 removed (non-responsive - ENOTFOUND)
       'oc1': 'sea',
       'sg2': 'sea',
@@ -189,18 +192,51 @@ class RiotAPIService {
       platform = this.platform;
     }
     
+    // CRITICAL FIX: Account API v1 only supports americas, asia, europe (NOT sea)
+    // If using Account API and region is sea, map to asia
+    if (forAccountAPI && region === 'sea') {
+      console.log(`   ⚠️  Account API v1 doesn't support 'sea' region. Mapping to 'asia' instead.`);
+      region = 'asia';
+    }
+    
+    // Match API v5 supports sea, so no mapping needed for that
+    
     return { region, platform };
+  }
+
+  // Throttle requests to respect rate limits
+  async throttleRequest() {
+    const now = Date.now();
+    
+    // Ensure minimum interval between requests
+    const timeSinceLastRequest = now - this.lastRequestTime;
+    if (timeSinceLastRequest < this.minRequestInterval) {
+      const waitTime = this.minRequestInterval - timeSinceLastRequest;
+      await new Promise(resolve => setTimeout(resolve, waitTime));
+    }
+    
+    // Track request timestamp
+    this.requestTimestamps.push(Date.now());
+    this.lastRequestTime = Date.now();
+    
+    // Check if we're approaching rate limit (20 requests per second)
+    const oneSecondAgo = now - 1000;
+    const recentRequests = this.requestTimestamps.filter(ts => ts > oneSecondAgo);
+    
+    if (recentRequests.length >= this.maxRequestsPerWindow) {
+      // Wait until we can make another request
+      const oldestRequest = Math.min(...recentRequests);
+      const waitTime = 1000 - (now - oldestRequest) + 10; // Add 10ms buffer
+      Logger.debug(`Rate limit approaching, waiting ${waitTime}ms`);
+      await new Promise(resolve => setTimeout(resolve, waitTime));
+    }
   }
 
   // Queue system to handle rate limiting
   async makeRequest(endpoint, params = {}, useMatchAPI = false, useAccountAPI = false, userRegion = null) {
-    if (!this.apiKey) {
-      throw new Error('RIOT_API_KEY is not configured. Please set it in your .env file.');
-    }
-    
-    // Validate API key is not empty
-    if (typeof this.apiKey !== 'string' || this.apiKey.trim().length === 0) {
-      throw new Error('RIOT_API_KEY is empty or invalid. Please check your .env file.');
+    // Check if we have any API keys available
+    if (APIKeyManager.apiKeys.length === 0) {
+      throw new Error('No API keys configured. Please set RIOT_API_KEY in your .env file.');
     }
     
     if (!endpoint || typeof endpoint !== 'string') {
@@ -220,22 +256,72 @@ class RiotAPIService {
     
     try {
       while (this.requestQueue.length > 0) {
+        // Check rate limits before processing
+        const rateLimitCheck = APIMonitor.canMakeRequest();
+        if (!rateLimitCheck.allowed) {
+          Logger.warn(`Rate limit reached, waiting ${rateLimitCheck.retryAfter}s`);
+          await new Promise(resolve => setTimeout(resolve, rateLimitCheck.retryAfter * 1000));
+          continue;
+        }
+        
+        // Throttle requests to respect rate limits
+        await this.throttleRequest();
+        
         const { endpoint, params, resolve, reject, useMatchAPI, useAccountAPI, userRegion } = this.requestQueue.shift();
         
-        try {
+        // Retry logic: try up to 3 API keys on 401 errors
+        let requestSucceeded = false;
+        let lastError = null;
+        const maxKeyRetries = Math.min(APIKeyManager.apiKeys.length, 3);
+        let keysTried = [];
+        
+        for (let keyAttempt = 0; keyAttempt < maxKeyRetries && !requestSucceeded; keyAttempt++) {
+          // Get API key for this request
+          let apiKeyInfo;
+          try {
+            apiKeyInfo = APIKeyManager.getNextAPIKey();
+          } catch (keyError) {
+            Logger.error('Failed to get API key:', keyError.message);
+            if (keyAttempt === 0) {
+              const error = new Error('No API keys available. Please configure RIOT_API_KEY in your .env file.');
+              error.response = { status: 500, statusText: 'Internal Server Error' };
+              reject(error);
+            }
+            break;
+          }
+          
+          const apiKey = apiKeyInfo.key;
+          const apiKeyId = apiKeyInfo.id;
+          keysTried.push(apiKeyId);
+          
+          if (!apiKey || typeof apiKey !== 'string' || apiKey.trim().length === 0) {
+            Logger.warn(`API key ${apiKeyId} is invalid, trying next key...`);
+            APIKeyManager.recordError(apiKeyId, 401);
+            continue;
+          }
+          
+          try {
           // Resolve region and platform for this request (use user-provided region if available)
-          const { region: requestRegion, platform: requestPlatform } = this.resolveRegionAndPlatform(userRegion || null);
+          // IMPORTANT: Pass API type flags to handle Account API v1's limitation (no 'sea' support)
+          const { region: requestRegion, platform: requestPlatform } = this.resolveRegionAndPlatform(
+            userRegion || null,
+            useAccountAPI,  // Account API v1 only supports americas, asia, europe
+            useMatchAPI     // Match API v5 supports americas, asia, europe, sea
+          );
           
           // Determine base URL based on API type and resolved region:
-          // - Account API v1: uses REGIONAL routing (no /lol prefix)
+          // - Account API v1: uses REGIONAL routing (americas, asia, europe only - NO sea)
           // - v4 APIs (Summoner, League, Champion Mastery): use PLATFORM routing values
-          // - v5 APIs (Match): use REGIONAL routing values
+          // - v5 APIs (Match): use REGIONAL routing values (includes sea)
           let baseURL;
           if (useAccountAPI) {
+            // Account API v1: https://{americas|asia|europe}.api.riotgames.com/riot
             baseURL = `https://${requestRegion}.api.riotgames.com/riot`;
           } else if (useMatchAPI) {
+            // Match API v5: https://{americas|asia|europe|sea}.api.riotgames.com/lol
             baseURL = `https://${requestRegion}.api.riotgames.com/lol`;
           } else {
+            // v4 APIs: https://{platform}.api.riotgames.com/lol (e.g., sg2, na1, euw1)
             baseURL = `https://${requestPlatform}.api.riotgames.com/lol`;
           }
           const url = `${baseURL}${endpoint}`;
@@ -244,29 +330,30 @@ class RiotAPIService {
           const cleanParams = { ...params };
           delete cleanParams._userRegion;
           
-          // Ensure API key is valid before making request
-          if (!this.apiKey || typeof this.apiKey !== 'string' || this.apiKey.trim().length === 0) {
-            const error = new Error('RIOT_API_KEY is empty or invalid');
-            error.response = { status: 401, statusText: 'Unauthorized' };
-            reject(error);
-            continue;
-          }
+          // API key already validated above
           
           // Build headers dynamically to ensure API key is always included
           const requestHeaders = {
-            'X-Riot-Token': this.apiKey.trim(),
+            'X-Riot-Token': apiKey.trim(),
             'Accept': 'application/json'
           };
           
           // Log request details for debugging (without exposing full API key)
-          const apiKeyPreview = this.apiKey ? `${this.apiKey.substring(0, 8)}...${this.apiKey.substring(this.apiKey.length - 4)}` : 'MISSING';
-          console.log(`🔍 Making API request:`, {
+          const apiKeyPreview = apiKey ? `${apiKey.substring(0, 8)}...${apiKey.substring(apiKey.length - 4)}` : 'MISSING';
+          Logger.debug(`Making API request`, {
             endpoint: endpoint,
             baseURL: baseURL,
+            fullURL: url,
+            requestRegion: requestRegion,
+            requestPlatform: requestPlatform,
+            userRegion: userRegion || 'default',
+            apiKeyId: apiKeyId,
             apiKeyPreview: apiKeyPreview,
-            apiKeyLength: this.apiKey?.length || 0,
+            apiKeyLength: apiKey?.length || 0,
             headerName: 'X-Riot-Token',
-            headerValueSet: !!requestHeaders['X-Riot-Token']
+            headerValueSet: !!requestHeaders['X-Riot-Token'],
+            useAccountAPI: useAccountAPI,
+            useMatchAPI: useMatchAPI
           });
           
           const response = await axios.get(url, {
@@ -280,23 +367,85 @@ class RiotAPIService {
             }
           });
           
+          const requestDuration = Date.now() - (response.config?.metadata?.startTime || Date.now());
+          
           // Check if response contains an error status object (Riot API error format)
           if (response.data && response.data.status && response.data.status.status_code) {
             // This is an error response from Riot API
+            const statusCode = response.data.status.status_code;
+            
+            // If 401 (authentication error), try next API key
+            if (statusCode === 401 && keyAttempt < maxKeyRetries - 1) {
+              Logger.warn(`API key ${apiKeyId} returned 401 (Unknown apikey), trying next key...`);
+              APIMonitor.recordRequest(apiKeyId, endpoint, statusCode, false, requestDuration);
+              APIKeyManager.recordError(apiKeyId, statusCode);
+              lastError = new Error(response.data.status.message || 'Unknown apikey');
+              lastError.response = {
+                status: statusCode,
+                statusText: response.data.status.message || 'Error',
+                data: response.data
+              };
+              lastError.apiKeyId = apiKeyId;
+              continue; // Try next key
+            }
+            
+            Logger.apiRequest('GET', endpoint, statusCode, requestDuration);
+            Logger.error(`API Error Response`, {
+              endpoint,
+              statusCode,
+              message: response.data.status.message,
+              url,
+              apiKeyId
+            });
+            
+            // Record error
+            APIMonitor.recordRequest(apiKeyId, endpoint, statusCode, false, requestDuration);
+            APIKeyManager.recordError(apiKeyId, statusCode);
+            
             const error = new Error(response.data.status.message || 'API Error');
             error.response = {
-              status: response.data.status.status_code,
+              status: statusCode,
               statusText: response.data.status.message || 'Error',
               data: response.data
             };
             error.config = { url };
-            error.url = url; // Store URL directly on error for easier access
+            error.url = url;
+            error.apiKeyId = apiKeyId;
             reject(error);
-            continue;
+            requestSucceeded = true; // Mark as handled
+            break;
           }
           
           // Check for HTTP error status codes
           if (response.status >= 400) {
+            // If 401 (authentication error), try next API key
+            if (response.status === 401 && keyAttempt < maxKeyRetries - 1) {
+              Logger.warn(`API key ${apiKeyId} returned 401, trying next key...`);
+              APIMonitor.recordRequest(apiKeyId, endpoint, response.status, false, requestDuration);
+              APIKeyManager.recordError(apiKeyId, response.status);
+              lastError = new Error(`HTTP ${response.status}: ${response.statusText || 'Error'}`);
+              lastError.response = {
+                status: response.status,
+                statusText: response.statusText,
+                data: response.data
+              };
+              lastError.apiKeyId = apiKeyId;
+              continue; // Try next key
+            }
+            
+            Logger.apiRequest('GET', endpoint, response.status, requestDuration);
+            Logger.error(`HTTP Error`, {
+              endpoint,
+              status: response.status,
+              statusText: response.statusText,
+              url,
+              apiKeyId
+            });
+            
+            // Record error
+            APIMonitor.recordRequest(apiKeyId, endpoint, response.status, false, requestDuration);
+            APIKeyManager.recordError(apiKeyId, response.status);
+            
             const error = new Error(`HTTP ${response.status}: ${response.statusText || 'Error'}`);
             error.response = {
               status: response.status,
@@ -304,127 +453,73 @@ class RiotAPIService {
               data: response.data
             };
             error.config = { url };
-            error.url = url; // Store URL directly on error for easier access
+            error.url = url;
+            error.apiKeyId = apiKeyId;
             reject(error);
-            continue;
+            requestSucceeded = true; // Mark as handled
+            break;
           }
+          
+          // Success!
+          Logger.apiRequest('GET', endpoint, response.status, requestDuration);
+          
+          // Record success
+          APIMonitor.recordRequest(apiKeyId, endpoint, response.status, false, requestDuration);
+          APIKeyManager.recordSuccess(apiKeyId);
           
           resolve(response.data);
+          requestSucceeded = true;
           
-          // Small delay between requests to respect rate limits
-          await new Promise(resolveDelay => setTimeout(resolveDelay, 50));
+          // Small delay between requests to respect rate limits (already throttled above)
+          await new Promise(resolveDelay => setTimeout(resolveDelay, 10));
+          break; // Exit retry loop on success
         } catch (error) {
-          // Enhanced error logging
-          if (error.response) {
-            const status = error.response.status;
-            const errorUrl = error.url || error.config?.url || 'Unknown URL';
-            console.error(`API Error [${status}]:`, {
-              url: errorUrl,
-              status: status,
-              statusText: error.response.statusText,
-              data: error.response.data
-            });
-            
-            // Special handling for 403 errors
-            if (status === 403) {
-              const errorUrl = error.url || error.config?.url || 'Unknown URL';
-              console.error('\n🔑 API Key Authentication Failed (403 Forbidden)');
-              console.error('   Request URL:', errorUrl);
-              console.error('   Response data:', JSON.stringify(error.response.data, null, 2));
-              console.error('   API Key length:', this.apiKey?.length || 0);
-              console.error('   API Key preview:', this.apiKey ? `${this.apiKey.substring(0, 8)}...${this.apiKey.substring(this.apiKey.length - 4)}` : 'MISSING');
-              console.error('   API Key format:', this.apiKey?.startsWith('RGAPI-') ? 'RGAPI- (Personal Key)' : 'Unknown format');
-              console.error('   Header used:', 'X-Riot-Token');
-              console.error('   Region configured:', this.region);
-              console.error('   Platform configured:', this.platform);
-              console.error('\n   ⚠️  IMPORTANT: Riot Personal API Keys expire after 24 hours!');
-              console.error('\n   Possible causes:');
-              console.error('   1. API key expired (most common - keys expire after 24 hours)');
-              console.error('   2. API key does not have Account API v1 permissions');
-              console.error('   3. API key type mismatch (needs Personal API Key, not Production)');
-              console.error('   4. API key is for a different region');
-              console.error('   5. API key contains extra whitespace or characters');
-              console.error('\n📝 To fix this:');
-              console.error('   1. Go to https://developer.riotgames.com/');
-              console.error('   2. Log in and check your API keys');
-              console.error('   3. Generate a NEW "Personal API Key" (old ones expire!)');
-              console.error('   4. Copy the key EXACTLY (no spaces before/after)');
-              console.error('   5. Update your .env file: RIOT_API_KEY=your_new_key_here');
-              console.error('   6. Make sure the key has access to Account API v1');
-              console.error('   7. Restart the bot');
-              console.error('\n💡 Run "node test-account-api.js" to test your API key\n');
-            }
-          } else if (error.request) {
-            if (error.code === 'ECONNABORTED' || error.message?.includes('timeout')) {
-              // Timeout error - retry with exponential backoff (max 3 retries)
-              const retryCount = (params._retryCount || 0) + 1;
-              if (retryCount > 3) {
-                console.error('API Request Timeout (Max retries reached):', {
-                  url: error.config?.url,
-                  message: 'Request timed out after 3 attempts'
-                });
-                reject(new Error('Request timeout: The API server did not respond in time. Please try again later.'));
-                continue;
-              }
-              
-              const backoffDelay = Math.min(1000 * Math.pow(2, retryCount - 1), 5000); // Exponential backoff: 1s, 2s, 4s (max 5s)
-              console.warn(`⏱️  Request timeout. Retrying in ${backoffDelay}ms... (Attempt ${retryCount}/3)`);
-              console.warn(`   URL: ${error.config?.url}`);
-              await new Promise(resolveDelay => setTimeout(resolveDelay, backoffDelay));
-              this.requestQueue.unshift({ 
-                endpoint, 
-                params: { ...params, _retryCount: retryCount }, 
-                resolve, 
-                reject, 
-                useMatchAPI,
-                useAccountAPI,
-                userRegion
-              });
-              continue;
-            } else {
-              console.error('API Request Error:', {
-                url: error.config?.url,
-                message: error.message,
-                code: error.code
-              });
-            }
-          } else {
-            console.error('API Error:', error.message);
+          // Handle axios errors
+          if (error.response && error.response.status === 401 && keyAttempt < maxKeyRetries - 1) {
+            Logger.warn(`API key ${apiKeyId} returned 401, trying next key...`);
+            APIMonitor.recordRequest(apiKeyId, endpoint, 401, false, 0);
+            APIKeyManager.recordError(apiKeyId, 401);
+            lastError = error;
+            lastError.apiKeyId = apiKeyId;
+            continue; // Try next key
           }
           
-          // Handle rate limiting (429 errors)
-          if (error.response?.status === 429) {
-            const retryCount = (params._retryCount || 0) + 1;
-            if (retryCount > 3) {
-              reject(new Error('Rate limit exceeded. Maximum retries reached.'));
-              continue;
-            }
-            
-            const retryAfter = parseInt(error.response.headers['retry-after'] || '1', 10);
-            console.log(`Rate limited. Waiting ${retryAfter} seconds... (Attempt ${retryCount}/3)`);
-            await new Promise(resolveDelay => setTimeout(resolveDelay, retryAfter * 1000));
-            this.requestQueue.unshift({ 
-              endpoint, 
-              params: { ...params, _retryCount: retryCount }, 
-              resolve, 
-              reject, 
-              useMatchAPI,
-              useAccountAPI,
-              userRegion
-            });
-            continue;
-          }
-          
-          // For all other errors, reject immediately
-          reject(error);
+          // For other errors, break and handle below
+          lastError = error;
+          lastError.apiKeyId = apiKeyId;
+          break;
         }
       }
+      
+      // If we exhausted all keys or had a non-401 error, reject
+      if (!requestSucceeded) {
+        if (lastError) {
+          Logger.error(`All API keys failed or error occurred:`, {
+            keysTried: keysTried,
+            lastError: lastError.message,
+            lastApiKeyId: lastError.apiKeyId
+          });
+          reject(lastError);
+        } else {
+          const error = new Error('All API keys failed authentication (401). Please check your API keys in .env file.');
+          error.response = { status: 401, statusText: 'Unauthorized' };
+          reject(error);
+        }
+        continue;
+      }
+      }
     } catch (error) {
-      console.error('❌ Critical error in request queue processing:', error);
-      // Reject all pending requests
+      Logger.error('Critical error in request queue processing:', {
+        message: error.message,
+        stack: error.stack,
+        queueLength: this.requestQueue.length
+      });
+      
+      // Reject all pending requests with detailed error
       while (this.requestQueue.length > 0) {
-        const { reject } = this.requestQueue.shift();
-        reject(new Error('Request queue processing failed'));
+        const { reject: rejectRequest } = this.requestQueue.shift();
+        const errorMessage = error.message || 'Request queue processing failed';
+        rejectRequest(new Error(errorMessage));
       }
     } finally {
       this.isProcessing = false;
@@ -443,12 +538,29 @@ class RiotAPIService {
       throw new Error('Tag line is required and must be a non-empty string');
     }
     
+    // Check cache first
+    const cacheKey = CacheService.generateKey('account', gameName.toLowerCase(), tagLine.toLowerCase(), userRegion || 'default');
+    const cachedAccount = CacheService.get(cacheKey);
+    if (cachedAccount) {
+      Logger.info(`Account cache HIT: ${gameName}#${tagLine}`, { region: userRegion });
+      // Record cache hit in monitor
+      APIMonitor.recordRequest('cache', 'account', 200, true, 0);
+      return cachedAccount;
+    }
+    
+    // Resolve region to ensure correct routing
+    const { region: resolvedRegion } = this.resolveRegionAndPlatform(userRegion || null);
+    Logger.info(`Account API Request - Region: ${resolvedRegion}, GameName: ${gameName}, TagLine: ${tagLine}`);
+    
     // Endpoint is /account/v1/... (base URL already includes /riot)
     const endpoint = `/account/v1/accounts/by-riot-id/${encodeURIComponent(gameName)}/${encodeURIComponent(tagLine)}`;
     
     try {
+      const startTime = Date.now();
       // Account API uses REGIONAL routing (v1 API) - separate base URL
       const account = await this.makeRequest(endpoint, {}, false, true, userRegion);
+      const duration = Date.now() - startTime;
+      Logger.apiRequest('GET', endpoint, 200, duration);
       
       // Validate response structure
       if (!account || typeof account !== 'object') {
@@ -474,13 +586,29 @@ class RiotAPIService {
         throw new Error('Invalid API response: Account data missing PUUID field');
       }
       
+      // Cache the account data
+      CacheService.set(cacheKey, account);
+      
       return account;
     } catch (error) {
-      // Preserve error status codes
+      // Preserve error status codes with region context
       if (error.response?.status) {
+        const { region: resolvedRegion } = this.resolveRegionAndPlatform(userRegion || null);
         const apiError = new Error(error.message || 'API Error');
         apiError.response = error.response;
         apiError.status = error.response.status;
+        apiError.region = resolvedRegion;
+        apiError.userRegion = userRegion;
+        
+        // Special logging for SEA region errors
+        if (resolvedRegion === 'sea') {
+          console.error(`⚠️  SEA Region API Error [${error.response.status}]:`);
+          console.error(`   Endpoint: /account/v1/accounts/by-riot-id/${gameName}/${tagLine}`);
+          console.error(`   Regional URL: https://sea.api.riotgames.com/riot/account/v1/accounts/by-riot-id/...`);
+          console.error(`   Error: ${error.message}`);
+          console.error(`   Response:`, JSON.stringify(error.response.data, null, 2));
+        }
+        
         throw apiError;
       }
       throw error;
@@ -495,11 +623,24 @@ class RiotAPIService {
       throw new Error('PUUID is required and must be a non-empty string');
     }
     
+    // Check cache first
+    const cacheKey = CacheService.generateKey('summoner', puuid, userRegion || 'default');
+    const cachedSummoner = CacheService.get(cacheKey);
+    if (cachedSummoner) {
+      Logger.info(`Summoner cache HIT: ${puuid.substring(0, 8)}...`, { region: userRegion });
+      // Record cache hit in monitor
+      APIMonitor.recordRequest('cache', 'summoner', 200, true, 0);
+      return cachedSummoner;
+    }
+    
     const endpoint = `/summoner/v4/summoners/by-puuid/${encodeURIComponent(puuid)}`;
     
     try {
+      const startTime = Date.now();
       // Summoner API uses PLATFORM routing (v4 API)
       const summoner = await this.makeRequest(endpoint, {}, false, false, userRegion);
+      const duration = Date.now() - startTime;
+      Logger.apiRequest('GET', endpoint, 200, duration);
       
       // Validate response structure
       if (!summoner || typeof summoner !== 'object') {
@@ -524,6 +665,9 @@ class RiotAPIService {
       if (!summoner.puuid) {
         throw new Error('Invalid API response: Summoner data missing PUUID field');
       }
+      
+      // Cache the summoner data
+      CacheService.set(cacheKey, summoner);
       
       return summoner;
     } catch (error) {
@@ -560,8 +704,17 @@ class RiotAPIService {
     }
     
     try {
+      // Resolve region for logging
+      // Account API v1 only supports americas, asia, europe (NOT sea)
+      const { region: resolvedRegion, platform: resolvedPlatform } = this.resolveRegionAndPlatform(userRegion || null, true, false);
+      console.log(`🔍 Looking up Riot ID: ${gameName}#${tagLine}`);
+      console.log(`   User-provided region: ${userRegion || 'none (using default)'}`);
+      console.log(`   Resolved region for Account API: ${resolvedRegion}${userRegion === 'sea' ? ' (mapped from sea to asia)' : ''}`);
+      console.log(`   Resolved platform for v4 APIs: ${resolvedPlatform}`);
+      console.log(`   Account API endpoint: https://${resolvedRegion}.api.riotgames.com/riot/account/v1/accounts/by-riot-id/...`);
+      console.log(`   Note: Account API v1 uses americas/asia/europe (maps SEA to asia)`);
+      
       // Step 1: Get account (PUUID) from Riot ID using Account API v1 (regional routing)
-      console.log(`🔍 Looking up Riot ID: ${gameName}#${tagLine}${userRegion ? ` (region: ${userRegion})` : ''}`);
       const account = await this.getAccountByRiotId(gameName, tagLine, userRegion);
       
       if (!account || !account.puuid) {
@@ -583,19 +736,24 @@ class RiotAPIService {
       };
     } catch (error) {
       // Preserve error status codes for proper handling
+      // Account API v1 only supports americas, asia, europe (NOT sea)
+      const { region: resolvedRegion } = this.resolveRegionAndPlatform(userRegion || null, true, false);
+      
       if (error.response?.status === 404) {
-        const regionMsg = userRegion ? ` in region ${userRegion}` : '';
+        const regionMsg = userRegion ? ` in region ${userRegion === 'sea' ? 'asia (Account API v1 maps sea to asia)' : resolvedRegion}` : '';
         const apiError = new Error(`Riot ID "${gameName}#${tagLine}" not found${regionMsg}`);
         apiError.response = error.response;
         apiError.status = 404;
-        apiError.region = userRegion;
+        apiError.region = resolvedRegion;
+        apiError.userRegion = userRegion;
         throw apiError;
       }
       if (error.response?.status === 403) {
-        const apiError = new Error('API key is invalid or expired (403 Forbidden)');
+        const apiError = new Error(`API key is invalid or expired (403 Forbidden) - Region: ${resolvedRegion}`);
         apiError.response = error.response;
         apiError.status = 403;
-        apiError.region = userRegion;
+        apiError.region = resolvedRegion;
+        apiError.userRegion = userRegion;
         throw apiError;
       }
       throw error;
@@ -665,7 +823,8 @@ class RiotAPIService {
 
   // Get match history
   // Uses REGIONAL routing value (v5 API)
-  async getMatchHistory(puuid, start = 0, count = 20, userRegion = null) {
+  // Note: No queue filter - fetches ALL game types (ranked, normal, ARAM, etc.)
+  async getMatchHistory(puuid, start = 0, count = 20, userRegion = null, queueId = null) {
     if (!puuid || typeof puuid !== 'string' || puuid.trim().length === 0) {
       throw new Error('PUUID is required and must be a non-empty string');
     }
@@ -675,11 +834,104 @@ class RiotAPIService {
     }
     
     const endpoint = `/match/v5/matches/by-puuid/${encodeURIComponent(puuid)}/ids`;
-    return this.makeRequest(endpoint, {
+    const params = {
       start,
-      count,
-      queue: 420 // Ranked Solo Queue
-    }, true, false, userRegion);
+      count
+    };
+    
+    // Only add queue filter if specified (for backward compatibility)
+    if (queueId !== null) {
+      params.queue = queueId;
+    }
+    
+    return this.makeRequest(endpoint, params, true, false, userRegion);
+  }
+
+  // Get all match IDs for a season (paginated)
+  // Fetches ALL game types (ranked, normal, ARAM, etc.) - no queue filter
+  // Fetches matches in batches of 100 until no more matches are found
+  // Removed safety limit to fetch ALL matches for the season
+  async getAllMatchHistoryForYear(puuid, season, userRegion = null) {
+    if (!puuid || typeof puuid !== 'string' || puuid.trim().length === 0) {
+      throw new Error('PUUID is required and must be a non-empty string');
+    }
+    
+    const allMatchIds = [];
+    let start = 0;
+    const batchSize = 100; // Maximum allowed by Riot API
+    let hasMore = true;
+    let consecutiveEmptyBatches = 0;
+    const maxEmptyBatches = 2; // Stop after 2 consecutive empty batches
+    
+    console.log(`📊 Fetching ALL matches for Season ${season} (all game types, no limit)...`);
+    
+    while (hasMore) {
+      try {
+        Logger.debug(`Fetching batch: start=${start}, count=${batchSize}...`);
+        // Fetch ALL game types (no queue filter) - includes ranked, normal, ARAM, etc.
+        const matchIds = await this.getMatchHistory(puuid, start, batchSize, userRegion, null);
+        
+        if (!matchIds || !Array.isArray(matchIds) || matchIds.length === 0) {
+          consecutiveEmptyBatches++;
+          Logger.debug(`Empty batch received (consecutive empty: ${consecutiveEmptyBatches})`);
+          
+          if (consecutiveEmptyBatches >= maxEmptyBatches) {
+            Logger.info(`No more matches found after ${consecutiveEmptyBatches} empty batches`);
+            hasMore = false;
+            break;
+          }
+          // Continue to next batch even if this one was empty
+          start += batchSize;
+          await new Promise(resolve => setTimeout(resolve, 100));
+          continue;
+        }
+        
+        // Reset empty batch counter if we got matches
+        consecutiveEmptyBatches = 0;
+        
+        allMatchIds.push(...matchIds);
+        Logger.debug(`Fetched ${matchIds.length} matches (total: ${allMatchIds.length}, start=${start})`);
+        
+        // Always increment start for next batch
+        start += batchSize;
+        
+        // If we got less than batchSize, we might have reached the end
+        // But still check next batch to be absolutely sure
+        if (matchIds.length < batchSize) {
+          Logger.debug(`Received ${matchIds.length} < ${batchSize} matches. Checking next batch to confirm end...`);
+          // Wait a bit before checking next batch
+          await new Promise(resolve => setTimeout(resolve, 200));
+        } else {
+          // Got full batch, continue fetching
+          // Add a small delay between batches to respect rate limits
+          await new Promise(resolve => setTimeout(resolve, 50));
+        }
+        
+      } catch (error) {
+        Logger.error(`Error fetching matches at start=${start}:`, error.message);
+        // If it's a rate limit error, wait and retry
+        if (error.response?.status === 429) {
+          const retryAfter = parseInt(error.response.headers['retry-after'] || '2', 10);
+          Logger.warn(`Rate limited. Waiting ${retryAfter} seconds before retry...`);
+          await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
+          // Retry the same batch (don't increment start)
+          continue;
+        }
+        // For other errors, try to continue with next batch
+        Logger.warn(`Continuing to next batch despite error...`);
+        start += batchSize;
+        consecutiveEmptyBatches++;
+        if (consecutiveEmptyBatches >= maxEmptyBatches) {
+          Logger.warn(`Too many consecutive errors, stopping pagination`);
+          hasMore = false;
+        } else {
+          await new Promise(resolve => setTimeout(resolve, 200));
+        }
+      }
+    }
+    
+    Logger.success(`Total match IDs fetched: ${allMatchIds.length}`);
+    return allMatchIds;
   }
 
   // Get match details
@@ -689,8 +941,26 @@ class RiotAPIService {
       throw new Error('Match ID is required and must be a non-empty string');
     }
     
+    // Check cache first (match details rarely change)
+    const cacheKey = CacheService.generateKey('matchDetails', matchId, userRegion || 'default');
+    const cachedMatch = CacheService.get(cacheKey);
+    if (cachedMatch) {
+      Logger.debug(`Match details cache HIT: ${matchId}`);
+      // Record cache hit in monitor
+      APIMonitor.recordRequest('cache', 'matchDetails', 200, true, 0);
+      return cachedMatch;
+    }
+    
     const endpoint = `/match/v5/matches/${encodeURIComponent(matchId)}`;
-    return this.makeRequest(endpoint, {}, true, false, userRegion);
+    const startTime = Date.now();
+    const matchDetails = await this.makeRequest(endpoint, {}, true, false, userRegion);
+    const duration = Date.now() - startTime;
+    Logger.apiRequest('GET', endpoint, 200, duration);
+    
+    // Cache the match details (24 hour TTL)
+    CacheService.set(cacheKey, matchDetails);
+    
+    return matchDetails;
   }
 
   // Get league entries for summoner

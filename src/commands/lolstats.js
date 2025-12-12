@@ -2,6 +2,9 @@
 const { SlashCommandBuilder, MessageFlags } = require('discord.js');
 const RiotAPIService = require('../services/RiotAPIService');
 const YearEndRewindCalculator = require('../utils/YearEndRewindCalculator');
+const ChampionNames = require('../utils/ChampionNames');
+const Logger = require('../utils/Logger');
+const moment = require('moment');
 
 module.exports = {
   
@@ -95,12 +98,12 @@ module.exports = {
     
     // Additional validation: game name and tag line should be reasonable length
     if (gameName.length > 16 || tagLine.length > 5) {
-      console.warn(`⚠️  Riot ID has unusual length: GameName=${gameName.length}, TagLine=${tagLine.length}`);
+      Logger.warn(`Riot ID has unusual length: GameName=${gameName.length}, TagLine=${tagLine.length}`);
     }
     
     try {
       // Log the received Riot ID for debugging
-      console.log(`📥 Received Riot ID: "${trimmedRiotId}" (length: ${trimmedRiotId.length})`);
+      Logger.info(`Received Riot ID: "${trimmedRiotId}" (length: ${trimmedRiotId.length})`);
       
       // Get summoner data using Riot ID (new recommended method)
       let summoner;
@@ -130,15 +133,52 @@ module.exports = {
         if (apiError.response?.status === 403 || apiError.status === 403) {
           const errorUrl = apiError.url || apiError.config?.url || 'Unknown URL';
           const errorDetails = apiError.response?.data ? JSON.stringify(apiError.response.data, null, 2) : 'No additional details';
-          console.error('🔑 403 Authentication Error Details:', {
+          const errorRegion = apiError.region || userRegion || 'unknown';
+          
+          Logger.error('403 Authentication Error Details:', {
             url: errorUrl,
             responseData: apiError.response?.data,
             riotId: trimmedRiotId,
+            region: errorRegion,
             apiKeyPreview: process.env.RIOT_API_KEY ? `${process.env.RIOT_API_KEY.substring(0, 8)}...${process.env.RIOT_API_KEY.substring(process.env.RIOT_API_KEY.length - 4)}` : 'MISSING'
           });
           
+          // Special message for SEA region 403 errors
+          let errorMessage = '❌ **API Authentication Failed (403 Forbidden)**\n\n';
+          
+          if (errorRegion === 'sea' || userRegion === 'sea') {
+            errorMessage += '**ℹ️ Note about SEA Region:**\n';
+            errorMessage += 'Account API v1 only supports `americas`, `asia`, and `europe`.\n';
+            errorMessage += 'When you select "sea", it\'s automatically mapped to "asia" for Account API.\n';
+            errorMessage += 'This 403 error suggests an API key issue, not a region mapping issue.\n\n';
+            errorMessage += '**⚠️ Most Common Cause:**\n';
+            errorMessage += '• **API key expired** - Riot Personal API Keys expire after **24 hours**\n\n';
+            errorMessage += '**Other possible causes:**\n';
+            errorMessage += '• API key missing Account API v1 permissions\n';
+            errorMessage += '• Wrong API key type (needs Personal API Key, not Production)\n';
+            errorMessage += '• API key format issue\n\n';
+          } else {
+            errorMessage += '**⚠️ Most Common Cause:**\n';
+            errorMessage += '• **API key expired** - Riot Personal API Keys expire after **24 hours**\n\n';
+            errorMessage += '**Other possible causes:**\n';
+            errorMessage += '• API key missing Account API v1 permissions\n';
+            errorMessage += '• Wrong API key type (needs Personal API Key, not Production)\n';
+            errorMessage += '• Region mismatch\n';
+            errorMessage += '• API key format issue\n\n';
+          }
+          
+          errorMessage += '**To fix:**\n';
+          errorMessage += '1. Go to https://developer.riotgames.com/\n';
+          errorMessage += '2. Log in and check your API keys\n';
+          errorMessage += '3. **Generate a NEW Personal API Key** (old ones expire!)\n';
+          errorMessage += '4. Ensure it has Account API v1 access\n';
+          errorMessage += '5. Copy the key EXACTLY (no spaces/quotes)\n';
+          errorMessage += '6. Update the bot\'s `.env` file: `RIOT_API_KEY=your_new_key_here`\n';
+          errorMessage += '7. Restart the bot\n\n';
+          errorMessage += 'Please contact the bot administrator to update the API key.';
+          
           await interaction.editReply({
-            content: '❌ **API Authentication Failed (403 Forbidden)**\n\nThe Riot API key is invalid, expired, or missing permissions.\n\n**⚠️ Most Common Cause:**\n• **API key expired** - Riot Personal API Keys expire after **24 hours**\n\n**Other possible causes:**\n• API key missing Account API v1 permissions\n• Wrong API key type (needs Personal API Key, not Production)\n• Region mismatch\n• API key format issue\n\n**To fix:**\n1. Go to https://developer.riotgames.com/\n2. Log in and check your API keys\n3. **Generate a NEW Personal API Key** (old ones expire!)\n4. Ensure it has Account API v1 access\n5. Copy the key EXACTLY (no spaces/quotes)\n6. Update the bot\'s `.env` file: `RIOT_API_KEY=your_new_key_here`\n7. Restart the bot\n\nPlease contact the bot administrator to update the API key.',
+            content: errorMessage,
             flags: MessageFlags.Ephemeral
           });
           return;
@@ -157,7 +197,7 @@ module.exports = {
         }
         
         // Log unexpected errors for debugging
-        console.error('Unexpected API error:', {
+        Logger.error('Unexpected API error:', {
           message: apiError.message,
           status: apiError.response?.status || apiError.status,
           riotId: trimmedRiotId
@@ -169,84 +209,208 @@ module.exports = {
       
       // Validate summoner response (should not reach here if API returned error)
       if (!summoner) {
-        console.error('Invalid summoner response:', summoner);
+        Logger.error('Invalid summoner response:', summoner);
         throw new Error('Invalid API response: No summoner data received');
       }
       
       if (!summoner.puuid) {
-        console.error('Summoner response missing PUUID:', JSON.stringify(summoner, null, 2));
+        Logger.error('Summoner response missing PUUID:', JSON.stringify(summoner, null, 2));
         throw new Error('Invalid API response: Summoner data missing PUUID');
       }
       
       // Get display name for user-friendly messages
       const displayName = summoner.riotId || (summoner.gameName && summoner.tagLine ? `${summoner.gameName}#${summoner.tagLine}` : null) || riotId;
-      console.log(`✅ Found summoner: ${displayName} (PUUID: ${summoner.puuid.substring(0, 8)}...)`);
+      Logger.success(`Found summoner: ${displayName} (PUUID: ${summoner.puuid.substring(0, 8)}...)`);
       
-      // Get match history (last 50 ranked games of the year)
-      const matchIds = await RiotAPIService.getMatchHistory(summoner.puuid, 0, 50, userRegion);
+      // Initialize champion names
+      await ChampionNames.initialize();
       
-      if (!matchIds || matchIds.length === 0) {
+      // Get current season information
+      const seasonInfo = YearEndRewindCalculator.getCurrentSeason();
+      const currentSeason = seasonInfo.season;
+      const seasonStartTimestamp = seasonInfo.seasonStart;
+      const seasonEndTimestamp = seasonInfo.seasonEnd;
+      
+      Logger.info(`Current Season: ${currentSeason} (${seasonInfo.seasonStartDate} to ${seasonInfo.seasonEndDate})`);
+      
+      // Get ALL match history for the season (paginated) - ALL game types
+      await interaction.editReply({
+        content: `📊 Fetching all matches for Season ${currentSeason} (all game types)... This may take a moment.`,
+        flags: MessageFlags.Ephemeral
+      });
+      
+      const allMatchIds = await RiotAPIService.getAllMatchHistoryForYear(summoner.puuid, currentSeason, userRegion);
+      
+      if (!allMatchIds || allMatchIds.length === 0) {
         await interaction.editReply({
-          content: `✅ Found Riot ID **${displayName}**, but no ranked matches found for this year. Try playing some ranked games first!`,
+          content: `✅ Found Riot ID **${displayName}**, but no matches found for Season ${currentSeason}. Try playing some games first!`,
           flags: MessageFlags.Ephemeral
         });
         return;
       }
       
-      // Get match details for each match
+      Logger.info(`Processing ${allMatchIds.length} match IDs, filtering for Season ${currentSeason}...`);
+      
+      // Update progress message
+      await interaction.editReply({
+        content: `📊 Processing ${allMatchIds.length} matches and filtering for Season ${currentSeason}...`,
+        flags: MessageFlags.Ephemeral
+      });
+      
+      // Get match details for each match and filter by season
+      // Optimize: Stop early if we've passed the season boundary (matches are in reverse chronological order)
       const matches = [];
-      for (const matchId of matchIds) {
+      let processedCount = 0;
+      let matchesOutsideSeason = 0;
+      const maxMatchesOutsideSeason = 50; // Stop if we see 50 consecutive matches outside the season
+      const updateInterval = Math.max(1, Math.floor(allMatchIds.length / 10)); // Update 10 times total
+      
+      Logger.debug(`Processing ${allMatchIds.length} match IDs...`);
+      
+      for (const matchId of allMatchIds) {
         try {
           const matchDetails = await RiotAPIService.getMatchDetails(matchId, userRegion);
           
           // Validate match details structure
           if (!matchDetails || !matchDetails.info || !Array.isArray(matchDetails.info.participants)) {
-            console.error(`Invalid match details structure for match ${matchId}`);
+            Logger.error(`Invalid match details structure for match ${matchId}`);
             continue;
           }
           
+          // Check if match is within the current season
+          // gameCreation is in milliseconds (Unix timestamp)
+          const gameCreation = matchDetails.info.gameCreation || 0;
+          
+          if (!gameCreation || gameCreation === 0) {
+            Logger.warn(`Match ${matchId} has invalid gameCreation timestamp - skipping`);
+            continue;
+          }
+          
+          const gameDate = moment(gameCreation);
+          
+          // Log first few matches for debugging
+          if (processedCount < 5) {
+            const isInSeason = gameCreation >= seasonStartTimestamp && gameCreation <= seasonEndTimestamp;
+            Logger.debug(`Match ${processedCount + 1}: date=${gameDate.format('YYYY-MM-DD HH:mm:ss')}, inSeason=${isInSeason}, timestamp=${gameCreation}`);
+          }
+          
+          // Check if match is within season bounds
+          const isInSeason = gameCreation >= seasonStartTimestamp && gameCreation <= seasonEndTimestamp;
+          
+          if (!isInSeason) {
+            // Match is outside the season
+            matchesOutsideSeason++;
+            
+            // Only stop early if we're clearly past the season START (matches are in reverse chronological order)
+            // This means we've gone back in time past the season start
+            // Be conservative: require many consecutive old matches before stopping
+            if (gameCreation < seasonStartTimestamp) {
+              if (matchesOutsideSeason >= maxMatchesOutsideSeason) {
+                Logger.info(`Stopping early: Found ${maxMatchesOutsideSeason} consecutive matches before Season ${currentSeason} start`);
+                Logger.debug(`Last match date: ${gameDate.format('YYYY-MM-DD')}, Season start: ${moment(seasonStartTimestamp).format('YYYY-MM-DD')}`);
+                break;
+              }
+            } else {
+              // Match is after season end (future match or edge case)
+              // Reset counter - we might still find season matches later
+              // This shouldn't happen often since matches are reverse chronological
+              matchesOutsideSeason = 0;
+            }
+            // Don't count matches outside season in statistics
+            continue;
+          }
+          
+          // Reset counter if we found a match in the season
+          matchesOutsideSeason = 0;
+          
           // Extract relevant data for the player
           const participant = matchDetails.info.participants.find(p => p && p.puuid === summoner.puuid);
-          if (participant) {
-            matches.push({
-              matchId,
-              championId: participant.championId || 0,
-              win: participant.win || false,
-              kills: participant.kills || 0,
-              deaths: participant.deaths || 0,
-              assists: participant.assists || 0,
-              gameCreation: matchDetails.info.gameCreation || 0
-            });
+          
+          if (!participant) {
+            Logger.warn(`Player not found in match ${matchId} - skipping`);
+            continue;
+          }
+          
+          // Validate participant data
+          if (participant.championId === undefined || participant.championId === null) {
+            Logger.warn(`Match ${matchId} missing championId - skipping`);
+            continue;
+          }
+          
+          matches.push({
+            matchId,
+            championId: participant.championId || 0,
+            win: participant.win || false,
+            kills: participant.kills || 0,
+            deaths: participant.deaths || 0,
+            assists: participant.assists || 0,
+            gameCreation: gameCreation
+          });
+          
+          processedCount++;
+          // Update progress periodically
+          if (processedCount % updateInterval === 0 || processedCount === allMatchIds.length) {
+            const progressPercent = Math.round((processedCount / allMatchIds.length) * 100);
+            Logger.debug(`Progress: ${processedCount}/${allMatchIds.length} (${progressPercent}%) - ${matches.length} matches in Season ${currentSeason}`);
           }
         } catch (matchError) {
-          console.error(`Error fetching match ${matchId}:`, matchError.message);
+          Logger.error(`Error fetching match ${matchId}:`, matchError.message);
           // Continue with other matches
+          processedCount++;
+        }
+      }
+      
+      Logger.success(`Filtered to ${matches.length} matches from Season ${currentSeason} (processed ${processedCount} total matches)`);
+      
+      // Log some statistics for validation
+      if (matches.length > 0) {
+        const sortedMatches = [...matches].sort((a, b) => a.gameCreation - b.gameCreation);
+        const firstMatchDate = moment(sortedMatches[0].gameCreation).format('YYYY-MM-DD');
+        const lastMatchDate = moment(sortedMatches[sortedMatches.length - 1].gameCreation).format('YYYY-MM-DD');
+        Logger.debug(`Match date range: ${firstMatchDate} to ${lastMatchDate}`);
+        Logger.debug(`Season range: ${seasonInfo.seasonStartDate} to ${seasonInfo.seasonEndDate}`);
+        
+        // Validate match dates are within season
+        const matchesOutsideRange = matches.filter(m => {
+          const matchDate = m.gameCreation;
+          return matchDate < seasonStartTimestamp || matchDate > seasonEndTimestamp;
+        });
+        if (matchesOutsideRange.length > 0) {
+          Logger.warn(`Warning: ${matchesOutsideRange.length} matches found outside season range!`);
         }
       }
       
       if (matches.length === 0) {
         await interaction.editReply({
-          content: `✅ Found Riot ID **${displayName}**, but couldn't retrieve match details. Please try again later.`,
+          content: `✅ Found Riot ID **${displayName}**, but no matches found for Season ${currentSeason} (${seasonInfo.seasonStartDate} to ${seasonInfo.seasonEndDate}). Try playing some games!`,
           flags: MessageFlags.Ephemeral
         });
         return;
       }
       
-      // Calculate year-end statistics
+      // Calculate season statistics
       const winRate = YearEndRewindCalculator.calculateWinRate(matches);
-      const mostPlayedChampions = YearEndRewindCalculator.getMostPlayedChampions(matches);
+      const mostPlayedChampions = YearEndRewindCalculator.getMostPlayedChampions(matches, 5);
       const kdaStats = YearEndRewindCalculator.calculateKDA(matches);
       const totalGames = YearEndRewindCalculator.calculateTotalGames(matches);
       
+      // Validate statistics
+      Logger.info(`Statistics calculated:`, {
+        totalGames,
+        winRate: `${winRate}%`,
+        kda: `${kdaStats.kills}/${kdaStats.deaths}/${kdaStats.assists} (${kdaStats.kda})`,
+        topChampions: mostPlayedChampions.length
+      });
+      
       // Prepare the response
       const embed = {
-        title: `🎮 ${displayName}'s ${YearEndRewindCalculator.currentYear} Year-end Rewind`,
-        description: `Here are your epic League of Legends statistics for ${YearEndRewindCalculator.currentYear}!`,
+        title: `🎮 ${displayName}'s Season ${currentSeason} Rewind`,
+        description: `Here are your epic League of Legends statistics for Season ${currentSeason}!`,
         color: 0x5865F2,
         fields: [
           {
             name: '🏆 Total Games Played',
-            value: `${totalGames} ranked games`,
+            value: `${totalGames} games`,
             inline: true
           },
           {
@@ -261,9 +425,10 @@ module.exports = {
           },
           {
             name: '👑 Most Played Champions',
-            value: mostPlayedChampions.map(champ => 
-              `Champion ID ${champ.championId}: ${champ.gamesPlayed} games (${champ.winRate}% WR)`
-            ).join('\n') || 'No champion data available',
+            value: mostPlayedChampions.map(champ => {
+              const championName = ChampionNames.getName(champ.championId);
+              return `${championName}: ${champ.gamesPlayed} games (${champ.winRate}% WR)`;
+            }).join('\n') || 'No champion data available',
             inline: false
           }
         ],
@@ -278,7 +443,7 @@ module.exports = {
       });
       
     } catch (error) {
-      console.error('Error fetching LoL stats:', {
+      Logger.error('Error fetching LoL stats:', {
         error: error.message,
         stack: error.stack,
         response: error.response?.data,

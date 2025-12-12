@@ -6,6 +6,37 @@ class YearEndRewindCalculator {
     this.currentYear = moment().year();
   }
 
+  // Get current season information
+  // League of Legends seasons typically run from January to November/December
+  getCurrentSeason() {
+    const now = moment();
+    const currentYear = now.year();
+    const currentMonth = now.month() + 1; // moment months are 0-indexed
+    
+    // Season year is the current year
+    const seasonYear = currentYear;
+    
+    // Season typically starts in January and ends in November
+    // Use January 1st 00:00:00 UTC as start and November 30th 23:59:59 UTC as end
+    const seasonStart = moment.utc(`${seasonYear}-01-01 00:00:00`);
+    const seasonEnd = moment.utc(`${seasonYear}-12-31 23:59:59`);
+    
+    // Convert to milliseconds (gameCreation is in milliseconds)
+    const seasonStartMs = seasonStart.valueOf();
+    const seasonEndMs = seasonEnd.valueOf();
+    
+    console.log(`📅 Season ${seasonYear}: ${seasonStart.format('YYYY-MM-DD')} to ${seasonEnd.format('YYYY-MM-DD')}`);
+    console.log(`   Timestamps: ${seasonStartMs} to ${seasonEndMs}`);
+    
+    return {
+      season: seasonYear,
+      seasonStart: seasonStartMs,
+      seasonEnd: seasonEndMs,
+      seasonStartDate: seasonStart.format('YYYY-MM-DD'),
+      seasonEndDate: seasonEnd.format('YYYY-MM-DD')
+    };
+  }
+
   // Calculate win rate from matches
   calculateWinRate(matches) {
     if (matches.length === 0) return 0;

@@ -12,8 +12,12 @@ yarn-error.log*
 .env.*
 
 # Logs
-logs
+logs/
 *.log
+
+# Data cache
+data/
+!data/.gitkeep
 
 # IDE / Editor
 .vscode/
