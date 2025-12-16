@@ -252,6 +252,53 @@ class APIMonitor {
     
     return { allowed: true };
   }
+  
+  // Record cache hit (for CacheService integration)
+  recordCacheHit() {
+    this.stats.totalCacheHits++;
+    const buckets = this.getTimeBuckets();
+    if (!this.stats.dailyStats[buckets.day]) {
+      this.stats.dailyStats[buckets.day] = { requests: 0, errors: 0, cacheHits: 0 };
+    }
+    if (!this.stats.hourlyStats[buckets.hour]) {
+      this.stats.hourlyStats[buckets.hour] = { requests: 0, errors: 0, cacheHits: 0 };
+    }
+    if (!this.stats.minuteStats[buckets.minute]) {
+      this.stats.minuteStats[buckets.minute] = { requests: 0, errors: 0, cacheHits: 0 };
+    }
+    this.stats.dailyStats[buckets.day].cacheHits++;
+    this.stats.hourlyStats[buckets.hour].cacheHits++;
+    this.stats.minuteStats[buckets.minute].cacheHits++;
+  }
+  
+  // Record cache miss (for CacheService integration)
+  recordCacheMiss() {
+    // Cache misses are tracked implicitly (total requests - cache hits)
+    // This method exists for consistency and future use
+  }
+  
+  // Get live statistics (for real-time monitoring)
+  getLiveStats() {
+    const buckets = this.getTimeBuckets();
+    const minuteStats = this.stats.minuteStats[buckets.minute] || { requests: 0, cacheHits: 0 };
+    const hourStats = this.stats.hourlyStats[buckets.hour] || { requests: 0, cacheHits: 0 };
+    const dayStats = this.stats.dailyStats[buckets.day] || { requests: 0, cacheHits: 0 };
+    
+    const totalRequests = this.stats.totalRequests || 0;
+    const totalCacheHits = this.stats.totalCacheHits || 0;
+    const totalCacheMisses = totalRequests - totalCacheHits;
+    const cacheHitRate = totalRequests > 0 ? (totalCacheHits / totalRequests) * 100 : 0;
+    
+    return {
+      requestsLastMinute: minuteStats.requests || 0,
+      requestsLastHour: hourStats.requests || 0,
+      requestsLastDay: dayStats.requests || 0,
+      totalRequests: totalRequests,
+      cacheHits: totalCacheHits,
+      cacheMisses: totalCacheMisses,
+      cacheHitRate: cacheHitRate
+    };
+  }
 }
 
 module.exports = new APIMonitor();

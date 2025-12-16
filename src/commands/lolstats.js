@@ -6,6 +6,154 @@ const ChampionNames = require('../utils/ChampionNames');
 const Logger = require('../utils/Logger');
 const moment = require('moment');
 
+// Check if interaction is still valid (not expired)
+function isInteractionValid(interaction) {
+  // Discord interaction tokens expire after 15 minutes
+  // We can't directly check expiration, but we can check if it's been replied to
+  // and if it's still deferred
+  try {
+    if (!interaction) return false;
+    // If it's deferred and not replied, it's likely still valid
+    // If it's replied, it might still be valid (but token could be expired)
+    return interaction.deferred || !interaction.replied;
+  } catch (error) {
+    return false;
+  }
+}
+
+// Helper function to safely edit reply (prevents message flooding by always editing the same message)
+async function safeEditReply(interaction, content, options = {}) {
+  // Check if interaction is still valid before attempting
+  if (!isInteractionValid(interaction)) {
+    Logger.warn('Interaction is no longer valid, skipping reply');
+    return null;
+  }
+  
+  // Normalize content - can be string or object with embeds
+  const isString = typeof content === 'string';
+  const replyData = {
+    content: isString ? content : (content.content || undefined),
+    embeds: content.embeds || options.embeds || undefined,
+    flags: options.flags
+  };
+  
+  // Remove undefined values
+  if (!replyData.content) delete replyData.content;
+  if (!replyData.embeds) delete replyData.embeds;
+  if (!replyData.flags) delete replyData.flags;
+  
+  try {
+    // IMPORTANT: Always try to edit the same message to prevent flooding
+    // Only use followUp as a last resort if editing is impossible
+    if (interaction.deferred && !interaction.replied) {
+      // Best case: We have a deferred reply, edit it
+      return await interaction.editReply(replyData);
+    } else if (interaction.replied) {
+      // Already replied - try to edit the original reply if possible
+      // If we can't edit, only then use followUp (but this should be rare)
+      try {
+        // Try to edit the original reply
+        return await interaction.editReply(replyData);
+      } catch (editError) {
+        // If editing fails, only then use followUp (but log it as it creates a new message)
+        Logger.warn('Could not edit reply, using followUp (this creates a new message):', editError.message);
+        return await interaction.followUp({
+          ...replyData,
+          flags: replyData.flags || MessageFlags.Ephemeral
+        });
+      }
+    } else {
+      // Not deferred and not replied - this shouldn't happen, but handle it
+      Logger.warn('Interaction not deferred, using reply (this should not happen)');
+      return await interaction.reply({
+        ...replyData,
+        flags: replyData.flags || MessageFlags.Ephemeral
+      });
+    }
+  } catch (error) {
+    // If token expired (50027) or interaction already replied, try followUp
+    if (error.code === 50027 || error.code === 50025 || interaction.replied) {
+      Logger.warn('Interaction token expired or already replied, attempting followUp', {
+        code: error.code,
+        message: error.message
+      });
+      
+      // Check if we can still use followUp (token might be completely expired)
+      if (error.code === 50027) {
+        // Token is completely expired, can't use followUp either
+        Logger.error('Interaction token completely expired, cannot send response');
+        
+        // Try multiple fallback methods
+        // 1. Try DM first
+        if (interaction.user && !interaction.user.bot) {
+          try {
+            await interaction.user.send({
+              content: isString ? content : (content.content || '❌ Your command took longer than 15 minutes and the interaction expired. The results may still be processing. Please try the command again in a moment.'),
+              embeds: content.embeds || options.embeds
+            });
+            Logger.info('Sent message via DM to user (interaction expired)');
+            return null; // Return null instead of throwing
+          } catch (dmError) {
+            // User has DMs disabled or other error - try channel instead
+            Logger.warn('Cannot send DM to user (DMs may be disabled):', dmError.message);
+            
+            // 2. Try sending to the channel where the command was used
+            if (interaction.channel && interaction.channel.send) {
+              try {
+                const channelMessage = await interaction.channel.send({
+                  content: `${interaction.user}, your command results (interaction expired):`,
+                  embeds: content.embeds || options.embeds || (isString ? undefined : [])
+                });
+                Logger.info('Sent message to channel as fallback (interaction expired)');
+                return channelMessage;
+              } catch (channelError) {
+                Logger.error('Cannot send message to channel:', channelError.message);
+                // Last resort: log the content so it's not completely lost
+                Logger.info('Results that could not be delivered:', {
+                  content: isString ? content : content.content,
+                  hasEmbeds: !!(content.embeds || options.embeds)
+                });
+              }
+            }
+            return null; // Return null instead of throwing
+          }
+        }
+        
+        // If no user, try channel directly
+        if (interaction.channel && interaction.channel.send) {
+          try {
+            const channelMessage = await interaction.channel.send({
+              content: 'Command results (interaction expired):',
+              embeds: content.embeds || options.embeds || (isString ? undefined : [])
+            });
+            Logger.info('Sent message to channel as fallback (interaction expired, no user)');
+            return channelMessage;
+          } catch (channelError) {
+            Logger.error('Cannot send message to channel:', channelError.message);
+          }
+        }
+        
+        return null; // Return null instead of throwing
+      }
+      
+      // Try followUp for other errors (50025, etc.)
+      try {
+        return await interaction.followUp({
+          ...replyData,
+          flags: replyData.flags || MessageFlags.Ephemeral
+        });
+      } catch (followUpError) {
+        Logger.error('Failed to send followUp message:', followUpError.message);
+        // Don't throw - just return null to indicate failure
+        return null;
+      }
+    }
+    // For other errors, log and return null instead of throwing
+    Logger.error('Error in safeEditReply:', error.message);
+    return null;
+  }
+}
+
 module.exports = {
   
   data: new SlashCommandBuilder()
@@ -35,6 +183,8 @@ module.exports = {
         )),
   
   async execute(interaction) {
+    // Defer reply immediately to prevent message flooding
+    // All subsequent updates will edit this same message
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     
     // Get user-provided region (optional)
@@ -48,8 +198,7 @@ module.exports = {
     
     // Validate Riot ID format
     if (!riotId) {
-      await interaction.editReply({
-        content: '❌ Please provide a valid Riot ID.\n\n**Format:** `GameName#TagLine`\n**Example:** `SummonerName#TAG1`',
+      await safeEditReply(interaction, '❌ Please provide a valid Riot ID.\n\n**Format:** `GameName#TagLine`\n**Example:** `SummonerName#TAG1`', {
         flags: MessageFlags.Ephemeral
       });
       return;
@@ -58,8 +207,7 @@ module.exports = {
     const trimmedRiotId = riotId.trim();
     
     if (trimmedRiotId.length === 0) {
-      await interaction.editReply({
-        content: '❌ Please provide a valid Riot ID.\n\n**Format:** `GameName#TagLine`\n**Example:** `SummonerName#TAG1`',
+      await safeEditReply(interaction, '❌ Please provide a valid Riot ID.\n\n**Format:** `GameName#TagLine`\n**Example:** `SummonerName#TAG1`', {
         flags: MessageFlags.Ephemeral
       });
       return;
@@ -68,16 +216,14 @@ module.exports = {
     // Check if Riot ID has the correct format (must contain exactly one #)
     const hashCount = (trimmedRiotId.match(/#/g) || []).length;
     if (hashCount === 0) {
-      await interaction.editReply({
-        content: '❌ Invalid Riot ID format.\n\n**Required format:** `GameName#TagLine`\n**Example:** `SummonerName#TAG1`\n\nMake sure to include the `#` symbol and your tag line.\n\n**Note:** Riot IDs require both a game name and tag line separated by `#`.',
+      await safeEditReply(interaction, '❌ Invalid Riot ID format.\n\n**Required format:** `GameName#TagLine`\n**Example:** `SummonerName#TAG1`\n\nMake sure to include the `#` symbol and your tag line.\n\n**Note:** Riot IDs require both a game name and tag line separated by `#`.', {
         flags: MessageFlags.Ephemeral
       });
       return;
     }
     
     if (hashCount > 1) {
-      await interaction.editReply({
-        content: '❌ Invalid Riot ID format.\n\n**Required format:** `GameName#TagLine`\n**Example:** `SummonerName#TAG1`\n\nRiot ID should contain exactly one `#` symbol.',
+      await safeEditReply(interaction, '❌ Invalid Riot ID format.\n\n**Required format:** `GameName#TagLine`\n**Example:** `SummonerName#TAG1`\n\nRiot ID should contain exactly one `#` symbol.', {
         flags: MessageFlags.Ephemeral
       });
       return;
@@ -89,8 +235,7 @@ module.exports = {
     const tagLine = parts[1] ? parts[1].trim() : '';
     
     if (parts.length !== 2 || gameName.length === 0 || tagLine.length === 0) {
-      await interaction.editReply({
-        content: `❌ Invalid Riot ID format.\n\n**Provided:** \`${trimmedRiotId}\`\n**Required format:** \`GameName#TagLine\`\n**Example:** \`SummonerName#TAG1\`\n\nBoth game name and tag line are required.`,
+      await safeEditReply(interaction, `❌ Invalid Riot ID format.\n\n**Provided:** \`${trimmedRiotId}\`\n**Required format:** \`GameName#TagLine\`\n**Example:** \`SummonerName#TAG1\`\n\nBoth game name and tag line are required.`, {
         flags: MessageFlags.Ephemeral
       });
       return;
@@ -123,8 +268,7 @@ module.exports = {
         if (apiError.response?.status === 404 || apiError.status === 404) {
           const regionInfo = userRegion ? ` in region **${userRegion}**` : '';
           const regionHint = userRegion ? '' : '\n💡 **Tip:** Try specifying your region using the `/lolstats` command\'s `region` option!';
-          await interaction.editReply({
-            content: `❌ Riot ID **${trimmedRiotId}** not found${regionInfo}.\n\nPlease check:\n• The Riot ID is spelled correctly (format: GameName#TagLine)\n• The tag line is correct (case-sensitive)\n• The account exists in the specified region${regionHint}\n• Try a different region if your account is in a different server`,
+          await safeEditReply(interaction, `❌ Riot ID **${trimmedRiotId}** not found${regionInfo}.\n\nPlease check:\n• The Riot ID is spelled correctly (format: GameName#TagLine)\n• The tag line is correct (case-sensitive)\n• The account exists in the specified region${regionHint}\n• Try a different region if your account is in a different server`, {
             flags: MessageFlags.Ephemeral
           });
           return;
@@ -177,10 +321,15 @@ module.exports = {
           errorMessage += '7. Restart the bot\n\n';
           errorMessage += 'Please contact the bot administrator to update the API key.';
           
-          await interaction.editReply({
-            content: errorMessage,
-            flags: MessageFlags.Ephemeral
-          });
+      // Try to send error, but don't throw if interaction expired
+      const result = await safeEditReply(interaction, errorMessage, {
+        flags: MessageFlags.Ephemeral
+      });
+      
+      // If we couldn't send the error message, at least log it
+      if (result === null) {
+        Logger.error('Could not send error message to user (interaction expired):', errorMessage);
+      }
           return;
         }
         
@@ -189,8 +338,7 @@ module.exports = {
             apiError.message?.includes('Network error') || 
             apiError.message?.includes('ECONNRESET') ||
             apiError.message?.includes('ETIMEDOUT')) {
-          await interaction.editReply({
-            content: '❌ **Network Error**\n\nUnable to connect to Riot API servers. This may be a temporary issue.\n\nPlease try again in a few moments.',
+          await safeEditReply(interaction, '❌ **Network Error**\n\nUnable to connect to Riot API servers. This may be a temporary issue.\n\nPlease try again in a few moments.', {
             flags: MessageFlags.Ephemeral
           });
           return;
@@ -233,17 +381,17 @@ module.exports = {
       
       Logger.info(`Current Season: ${currentSeason} (${seasonInfo.seasonStartDate} to ${seasonInfo.seasonEndDate})`);
       
-      // Get ALL match history for the season (paginated) - ALL game types
-      await interaction.editReply({
-        content: `📊 Fetching all matches for Season ${currentSeason} (all game types)... This may take a moment.`,
+      // Get ALL match history for the season (paginated) - Ranked games only
+      // Edit the same message (prevents channel flooding)
+      await safeEditReply(interaction, `📊 Fetching all ranked matches for Season ${currentSeason}... This may take a moment.`, {
         flags: MessageFlags.Ephemeral
       });
       
       const allMatchIds = await RiotAPIService.getAllMatchHistoryForYear(summoner.puuid, currentSeason, userRegion);
       
       if (!allMatchIds || allMatchIds.length === 0) {
-        await interaction.editReply({
-          content: `✅ Found Riot ID **${displayName}**, but no matches found for Season ${currentSeason}. Try playing some games first!`,
+        // Edit the same message with final result (prevents channel flooding)
+        await safeEditReply(interaction, `✅ Found Riot ID **${displayName}**, but no matches found for Season ${currentSeason}. Try playing some games first!`, {
           flags: MessageFlags.Ephemeral
         });
         return;
@@ -251,9 +399,8 @@ module.exports = {
       
       Logger.info(`Processing ${allMatchIds.length} match IDs, filtering for Season ${currentSeason}...`);
       
-      // Update progress message
-      await interaction.editReply({
-        content: `📊 Processing ${allMatchIds.length} matches and filtering for Season ${currentSeason}...`,
+      // Update progress message (edits the same message - prevents channel flooding)
+      await safeEditReply(interaction, `📊 Processing ${allMatchIds.length} matches and filtering for Season ${currentSeason}...`, {
         flags: MessageFlags.Ephemeral
       });
       
@@ -263,7 +410,10 @@ module.exports = {
       let processedCount = 0;
       let matchesOutsideSeason = 0;
       const maxMatchesOutsideSeason = 50; // Stop if we see 50 consecutive matches outside the season
-      const updateInterval = Math.max(1, Math.floor(allMatchIds.length / 10)); // Update 10 times total
+      const updateInterval = Math.max(1, Math.floor(allMatchIds.length / 20)); // Update 20 times total (more frequent)
+      const lastUpdateTime = Date.now();
+      const updateFrequency = 30000; // Update every 30 seconds to keep interaction alive
+      let lastProgressUpdate = Date.now();
       
       Logger.debug(`Processing ${allMatchIds.length} match IDs...`);
       
@@ -348,9 +498,26 @@ module.exports = {
           });
           
           processedCount++;
-          // Update progress periodically
-          if (processedCount % updateInterval === 0 || processedCount === allMatchIds.length) {
+          
+          // Progress update every N matches OR every 30 seconds (to keep interaction alive)
+          const timeSinceLastUpdate = Date.now() - lastProgressUpdate;
+          const shouldUpdate = processedCount % updateInterval === 0 || 
+                               processedCount === allMatchIds.length || 
+                               timeSinceLastUpdate >= updateFrequency;
+          
+          if (shouldUpdate) {
             const progressPercent = Math.round((processedCount / allMatchIds.length) * 100);
+            const result = await safeEditReply(interaction, `📊 Processing matches: ${processedCount}/${allMatchIds.length} (${progressPercent}%)... Found ${matches.length} season matches so far.`, {
+              flags: MessageFlags.Ephemeral
+            });
+            
+            // If we can't update (token expired), log but continue processing
+            if (result === null) {
+              Logger.warn('Cannot send progress update (interaction may have expired), continuing processing...');
+            } else {
+              lastProgressUpdate = Date.now();
+            }
+            
             Logger.debug(`Progress: ${processedCount}/${allMatchIds.length} (${progressPercent}%) - ${matches.length} matches in Season ${currentSeason}`);
           }
         } catch (matchError) {
@@ -381,8 +548,7 @@ module.exports = {
       }
       
       if (matches.length === 0) {
-        await interaction.editReply({
-          content: `✅ Found Riot ID **${displayName}**, but no matches found for Season ${currentSeason} (${seasonInfo.seasonStartDate} to ${seasonInfo.seasonEndDate}). Try playing some games!`,
+        await safeEditReply(interaction, `✅ Found Riot ID **${displayName}**, but no matches found for Season ${currentSeason} (${seasonInfo.seasonStartDate} to ${seasonInfo.seasonEndDate}). Try playing some games!`, {
           flags: MessageFlags.Ephemeral
         });
         return;
@@ -438,9 +604,23 @@ module.exports = {
         timestamp: new Date().toISOString()
       };
       
-      await interaction.editReply({ 
-        embeds: [embed]
-      });
+      // Try to send final result, but don't throw if interaction expired
+      // safeEditReply will handle all fallbacks (DM -> Channel -> Log)
+      const result = await safeEditReply(interaction, { embeds: [embed] }, {});
+      
+      if (result === null) {
+        // All fallback methods failed, log the results for debugging
+        Logger.warn('All delivery methods failed (interaction expired, DM disabled, channel unavailable)');
+        Logger.info('Stats calculated successfully but could not be delivered:', {
+          user: interaction.user?.tag || 'unknown',
+          channel: interaction.channel?.id || 'unknown',
+          totalGames,
+          winRate: `${winRate}%`,
+          kda: `${kdaStats.kills}/${kdaStats.deaths}/${kdaStats.assists}`
+        });
+      } else {
+        Logger.success('Stats delivered successfully to user');
+      }
       
     } catch (error) {
       Logger.error('Error fetching LoL stats:', {
@@ -491,8 +671,7 @@ module.exports = {
         }
       }
       
-      await interaction.editReply({
-        content: errorMessage,
+      await safeEditReply(interaction, errorMessage, {
         flags: MessageFlags.Ephemeral
       });
     }

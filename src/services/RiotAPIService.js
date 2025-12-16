@@ -21,7 +21,7 @@ class RiotAPIService {
       Logger.error('No API keys available!');
       Logger.error('Please set RIOT_API_KEY or RIOT_API_KEY_2, RIOT_API_KEY_3, etc. in your .env file');
       Logger.error('Get your API key from: https://developer.riotgames.com/');
-    } else {
+      } else {
       Logger.success(`RiotAPIService initialized with ${APIKeyManager.apiKeys.length} API key(s)`);
     }
     
@@ -233,6 +233,8 @@ class RiotAPIService {
   }
 
   // Queue system to handle rate limiting
+  // IMPORTANT: This function is ONLY called when cache is missed
+  // Cached data bypasses this entirely and returns immediately
   async makeRequest(endpoint, params = {}, useMatchAPI = false, useAccountAPI = false, userRegion = null) {
     // Check if we have any API keys available
     if (APIKeyManager.apiKeys.length === 0) {
@@ -243,6 +245,8 @@ class RiotAPIService {
       throw new Error('Invalid endpoint provided');
     }
     
+    // Queue the request - rate limiting will be applied in processQueue()
+    // Note: Cached data never reaches this point, so rate limiting only applies to actual API calls
     return new Promise((resolve, reject) => {
       this.requestQueue.push({ endpoint, params, resolve, reject, useMatchAPI, useAccountAPI, userRegion });
       this.processQueue();
@@ -256,15 +260,17 @@ class RiotAPIService {
     
     try {
       while (this.requestQueue.length > 0) {
-        // Check rate limits before processing
+        // IMPORTANT: Rate limiting applies ONLY to actual API requests
+        // Cached data never reaches this queue, so it's never rate-limited
+        // Check rate limits before processing API request
         const rateLimitCheck = APIMonitor.canMakeRequest();
         if (!rateLimitCheck.allowed) {
-          Logger.warn(`Rate limit reached, waiting ${rateLimitCheck.retryAfter}s`);
+          Logger.warn(`Rate limit reached, waiting ${rateLimitCheck.retryAfter}s (only applies to API requests, not cached data)`);
           await new Promise(resolve => setTimeout(resolve, rateLimitCheck.retryAfter * 1000));
           continue;
         }
         
-        // Throttle requests to respect rate limits
+        // Throttle requests to respect rate limits (only for actual API calls)
         await this.throttleRequest();
         
         const { endpoint, params, resolve, reject, useMatchAPI, useAccountAPI, userRegion } = this.requestQueue.shift();
@@ -416,6 +422,21 @@ class RiotAPIService {
             break;
           }
           
+          // Extract rate limit headers from response (as per user requirement)
+          // This will be used for both error and success cases
+          const rateLimitHeaders = {
+            'X-App-Rate-Limit': response.headers['x-app-rate-limit'] || response.headers['X-App-Rate-Limit'],
+            'X-App-Rate-Limit-Count': response.headers['x-app-rate-limit-count'] || response.headers['X-App-Rate-Limit-Count'],
+            'X-Method-Rate-Limit': response.headers['x-method-rate-limit'] || response.headers['X-Method-Rate-Limit'],
+            'X-Method-Rate-Limit-Count': response.headers['x-method-rate-limit-count'] || response.headers['X-Method-Rate-Limit-Count'],
+            'Retry-After': response.headers['retry-after'] || response.headers['Retry-After']
+          };
+          
+          // Log rate limit headers for monitoring (as per user requirement)
+          if (rateLimitHeaders['X-App-Rate-Limit'] || rateLimitHeaders['X-Method-Rate-Limit']) {
+            Logger.debug('Rate limit headers received:', rateLimitHeaders);
+          }
+          
           // Check for HTTP error status codes
           if (response.status >= 400) {
             // If 401 (authentication error), try next API key
@@ -460,12 +481,38 @@ class RiotAPIService {
             break;
           }
           
-          // Success!
+          // Success! (rateLimitHeaders already extracted above)
           Logger.apiRequest('GET', endpoint, response.status, requestDuration);
           
           // Record success
           APIMonitor.recordRequest(apiKeyId, endpoint, response.status, false, requestDuration);
           APIKeyManager.recordSuccess(apiKeyId);
+          
+          // Log response details for match history requests (as per user requirement)
+          if (endpoint.includes('/matches/by-puuid') && endpoint.includes('/ids')) {
+            Logger.debug('Match history API response:', {
+              url: url,
+              params: cleanParams,
+              status: response.status,
+              matchCount: Array.isArray(response.data) ? response.data.length : 0,
+              rateLimitHeaders: rateLimitHeaders,
+              responseBodyType: Array.isArray(response.data) ? 'array' : typeof response.data
+            });
+            
+            // Validate response is an array of match IDs (as per user requirement)
+            if (!Array.isArray(response.data)) {
+              Logger.error('Invalid response format: Expected array of match IDs, got:', typeof response.data);
+              const error = new Error('Invalid API response: Expected array of match IDs');
+              error.response = {
+                status: response.status,
+                statusText: 'Invalid response format',
+                data: response.data
+              };
+              reject(error);
+              requestSucceeded = true;
+              break;
+            }
+          }
           
           resolve(response.data);
           requestSucceeded = true;
@@ -506,7 +553,7 @@ class RiotAPIService {
           reject(error);
         }
         continue;
-      }
+        }
       }
     } catch (error) {
       Logger.error('Critical error in request queue processing:', {
@@ -538,11 +585,12 @@ class RiotAPIService {
       throw new Error('Tag line is required and must be a non-empty string');
     }
     
-    // Check cache first
+    // IMPORTANT: Check cache FIRST - cached data bypasses rate limiting entirely
+    // Cached data returns immediately without any rate limit checks or API calls
     const cacheKey = CacheService.generateKey('account', gameName.toLowerCase(), tagLine.toLowerCase(), userRegion || 'default');
     const cachedAccount = CacheService.get(cacheKey);
     if (cachedAccount) {
-      Logger.info(`Account cache HIT: ${gameName}#${tagLine}`, { region: userRegion });
+      Logger.info(`Account cache HIT: ${gameName}#${tagLine} (bypassing rate limits)`, { region: userRegion });
       // Record cache hit in monitor
       APIMonitor.recordRequest('cache', 'account', 200, true, 0);
       return cachedAccount;
@@ -623,14 +671,15 @@ class RiotAPIService {
       throw new Error('PUUID is required and must be a non-empty string');
     }
     
-    // Check cache first
+    // IMPORTANT: Check cache FIRST - cached data bypasses rate limiting entirely
+    // Cached data returns immediately without any rate limit checks or API calls
     const cacheKey = CacheService.generateKey('summoner', puuid, userRegion || 'default');
     const cachedSummoner = CacheService.get(cacheKey);
     if (cachedSummoner) {
-      Logger.info(`Summoner cache HIT: ${puuid.substring(0, 8)}...`, { region: userRegion });
-      // Record cache hit in monitor
+      Logger.info(`Summoner cache HIT: ${puuid.substring(0, 8)}... (bypassing rate limits)`, { region: userRegion });
+      // Record cache hit in monitor (not counted as API request)
       APIMonitor.recordRequest('cache', 'summoner', 200, true, 0);
-      return cachedSummoner;
+      return cachedSummoner; // Return immediately - no rate limiting applied
     }
     
     const endpoint = `/summoner/v4/summoners/by-puuid/${encodeURIComponent(puuid)}`;
@@ -833,42 +882,122 @@ class RiotAPIService {
       throw new Error('Invalid start or count parameters');
     }
     
+    // Generate cache key for this batch (include type=ranked in cache key)
+    const cacheKey = CacheService.generateKey('matchHistoryBatch', puuid, start, count, userRegion || 'default', 'ranked', queueId || 'all');
+    
+    // IMPORTANT: Check cache FIRST - cached data bypasses rate limiting entirely
+    // Cached data returns immediately without any rate limit checks or API calls
+    const cachedBatch = CacheService.get(cacheKey, null, true);
+    if (cachedBatch) {
+      Logger.debug(`Match history batch cache HIT: puuid=${puuid.substring(0, 8)}..., start=${start}, count=${count} (bypassing rate limits)`);
+      // Return cached data immediately - no rate limiting applied
+      return cachedBatch;
+    }
+    
+    // Cache miss - fetch from API (rate limiting applies only to actual API requests)
+    // Request format: /match/v5/matches/by-puuid/{puuid}/ids?type=ranked&start={start}&count={count}
     const endpoint = `/match/v5/matches/by-puuid/${encodeURIComponent(puuid)}/ids`;
     const params = {
-      start,
-      count
+      type: 'ranked', // Required: Filter for ranked games only
+      start: start,   // Pagination start index
+      count: count    // Number of matches to fetch (100 when fetching all)
     };
     
     // Only add queue filter if specified (for backward compatibility)
+    // Note: type=ranked takes precedence, but queueId can be used for additional filtering
     if (queueId !== null) {
       params.queue = queueId;
     }
     
-    return this.makeRequest(endpoint, params, true, false, userRegion);
+    // Log request parameters to match user's expected format
+    Logger.debug('Match history request:', {
+      endpoint: endpoint,
+      params: params,
+      expectedFormat: `type=ranked&start=${start}&count=${count}`
+    });
+    
+    const matchIds = await this.makeRequest(endpoint, params, true, false, userRegion);
+    
+    // Validate response is an array of match IDs (as per user requirement)
+    if (!Array.isArray(matchIds)) {
+      Logger.error('Invalid response format: Expected array of match IDs, got:', typeof matchIds);
+      throw new Error('Invalid API response: Expected array of match IDs');
+    }
+    
+    // Cache the result for future requests
+    if (matchIds && Array.isArray(matchIds)) {
+      CacheService.set(cacheKey, matchIds);
+      Logger.debug(`Cached match history batch: ${matchIds.length} matches`);
+    }
+    
+    return matchIds;
   }
 
   // Get all match IDs for a season (paginated)
-  // Fetches ALL game types (ranked, normal, ARAM, etc.) - no queue filter
+  // Fetches ranked games only (type=ranked)
   // Fetches matches in batches of 100 until no more matches are found
-  // Removed safety limit to fetch ALL matches for the season
+  // Uses caching to minimize API calls and smooth rate limiting
   async getAllMatchHistoryForYear(puuid, season, userRegion = null) {
     if (!puuid || typeof puuid !== 'string' || puuid.trim().length === 0) {
       throw new Error('PUUID is required and must be a non-empty string');
     }
     
+    // IMPORTANT: Check cache FIRST - cached data bypasses rate limiting entirely
+    // Cached data returns immediately without any rate limit checks or API calls
+    const fullCacheKey = CacheService.generateKey('matchHistoryFull', puuid, season, userRegion || 'default', 'ranked');
+    const cachedFullHistory = CacheService.get(fullCacheKey, null, true); // Allow stale data
+    if (cachedFullHistory && Array.isArray(cachedFullHistory) && cachedFullHistory.length > 0) {
+      Logger.info(`Full match history cache HIT: ${cachedFullHistory.length} matches for season ${season} (bypassing rate limits)`);
+      // Return cached data immediately - no rate limiting applied
+      // Refresh in background if stale (doesn't block return)
+      if (this.isCacheStale(fullCacheKey)) {
+        Logger.debug('Cache is stale, refreshing in background...');
+        // Refresh in background (don't await) - this will use rate limiting when making API calls
+        this.refreshMatchHistoryInBackground(puuid, season, userRegion, fullCacheKey).catch(err => {
+          Logger.error('Background refresh failed:', err.message);
+        });
+      }
+      return cachedFullHistory;
+    }
+    
     const allMatchIds = [];
     let start = 0;
-    const batchSize = 100; // Maximum allowed by Riot API
+    const batchSize = 100; // Maximum allowed by Riot API (matches user requirement: count=100)
     let hasMore = true;
     let consecutiveEmptyBatches = 0;
     const maxEmptyBatches = 2; // Stop after 2 consecutive empty batches
+    let cachedBatchesUsed = 0;
+    let apiCallsMade = 0;
     
-    console.log(`📊 Fetching ALL matches for Season ${season} (all game types, no limit)...`);
+    Logger.info(`📊 Fetching ranked matches for Season ${season} (using cache)...`);
     
     while (hasMore) {
       try {
-        Logger.debug(`Fetching batch: start=${start}, count=${batchSize}...`);
-        // Fetch ALL game types (no queue filter) - includes ranked, normal, ARAM, etc.
+        // IMPORTANT: Check cache FIRST - cached data bypasses rate limiting entirely
+        // Cached data returns immediately without any rate limit checks or API calls
+        const batchCacheKey = CacheService.generateKey('matchHistoryBatch', puuid, start, batchSize, userRegion || 'default', 'ranked', 'all');
+        const cachedBatch = CacheService.get(batchCacheKey, null, true);
+        
+        if (cachedBatch && Array.isArray(cachedBatch) && cachedBatch.length > 0) {
+          // Use cached batch - no rate limiting applied, returns immediately
+          cachedBatchesUsed++;
+          allMatchIds.push(...cachedBatch);
+          Logger.debug(`Using cached batch: start=${start}, count=${cachedBatch.length} (total cached batches: ${cachedBatchesUsed}) - bypassing rate limits`);
+          
+          // If batch is smaller than batchSize, we've reached the end
+          if (cachedBatch.length < batchSize) {
+            Logger.info(`Reached end of matches (cached batch had ${cachedBatch.length} < ${batchSize} matches)`);
+            hasMore = false;
+            break;
+          }
+          
+          start += batchSize;
+          continue; // Continue to next batch immediately (no rate limit delay)
+        }
+        
+        // Cache miss - fetch from API (rate limiting applies only to actual API requests)
+        Logger.debug(`Fetching batch from API: start=${start}, count=${batchSize}...`);
+        apiCallsMade++;
         const matchIds = await this.getMatchHistory(puuid, start, batchSize, userRegion, null);
         
         if (!matchIds || !Array.isArray(matchIds) || matchIds.length === 0) {
@@ -890,7 +1019,7 @@ class RiotAPIService {
         consecutiveEmptyBatches = 0;
         
         allMatchIds.push(...matchIds);
-        Logger.debug(`Fetched ${matchIds.length} matches (total: ${allMatchIds.length}, start=${start})`);
+        Logger.debug(`Fetched ${matchIds.length} matches (total: ${allMatchIds.length}, start=${start}, API calls: ${apiCallsMade}, cached batches: ${cachedBatchesUsed})`);
         
         // Always increment start for next batch
         start += batchSize;
@@ -930,8 +1059,32 @@ class RiotAPIService {
       }
     }
     
-    Logger.success(`Total match IDs fetched: ${allMatchIds.length}`);
+    // Cache the full match history for future requests
+    if (allMatchIds.length > 0) {
+      CacheService.set(fullCacheKey, allMatchIds);
+      Logger.info(`Cached full match history: ${allMatchIds.length} matches for season ${season}`);
+    }
+    
+    Logger.success(`Total match IDs fetched: ${allMatchIds.length} (API calls: ${apiCallsMade}, cached batches: ${cachedBatchesUsed})`);
     return allMatchIds;
+  }
+  
+  // Check if cache is stale (for stale-while-revalidate)
+  isCacheStale(key) {
+    // This is a simplified check - in production, you'd check the actual cache entry age
+    return false; // For now, we'll let CacheService handle stale detection
+  }
+  
+  // Refresh match history in background (stale-while-revalidate pattern)
+  async refreshMatchHistoryInBackground(puuid, season, userRegion, cacheKey) {
+    try {
+      Logger.debug('Background refresh: Fetching fresh match history...');
+      // Fetch fresh data (this will update the cache)
+      await this.getAllMatchHistoryForYear(puuid, season, userRegion);
+      Logger.debug('Background refresh: Match history updated');
+    } catch (error) {
+      Logger.error('Background refresh failed:', error.message);
+    }
   }
 
   // Get match details
@@ -941,11 +1094,12 @@ class RiotAPIService {
       throw new Error('Match ID is required and must be a non-empty string');
     }
     
-    // Check cache first (match details rarely change)
+    // IMPORTANT: Check cache FIRST - cached data bypasses rate limiting entirely
+    // Cached data returns immediately without any rate limit checks or API calls
     const cacheKey = CacheService.generateKey('matchDetails', matchId, userRegion || 'default');
     const cachedMatch = CacheService.get(cacheKey);
     if (cachedMatch) {
-      Logger.debug(`Match details cache HIT: ${matchId}`);
+      Logger.debug(`Match details cache HIT: ${matchId} (bypassing rate limits)`);
       // Record cache hit in monitor
       APIMonitor.recordRequest('cache', 'matchDetails', 200, true, 0);
       return cachedMatch;
